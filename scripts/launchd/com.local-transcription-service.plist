@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local-transcription-service</string>
+
+    <!-- Run as the logged-in user. -->
+    <key>UserName</key>
+    <string>__REPLACE_WITH_USERNAME__</string>
+
+    <!-- Service program. Adjust paths after `uv sync`. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPLACE_WITH_REPO_ROOT__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>local_transcription_service.app</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPLACE_WITH_REPO_ROOT__</string>
+
+    <!-- Service-specific env. Override or extend per-host. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>LTS_DATA_DIR</key>
+        <string>__REPLACE_WITH_DATA_DIR__</string>
+    </dict>
+
+    <!-- Run on user login; restart on crash. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Throttle restart attempts. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- stdout/stderr captured by launchd. Inspect with:
+         log show --predicate 'process == "Python"' --last 1h
+         or tail -f ~/Library/Logs/local-transcription-service.log -->
+    <key>StandardOutPath</key>
+    <string>__REPLACE_WITH_LOG_PATH__</string>
+    <key>StandardErrorPath</key>
+    <string>__REPLACE_WITH_LOG_PATH__</string>
+</dict>
+</plist>
