@@ -30,10 +30,12 @@ async def test_process_one_runs_mock_pipeline_and_marks_done(
     assert after.status == JobStatus.DONE
     assert after.attempt == 1
     assert after.transcript_path is not None
-    assert (
-        Path(after.transcript_path).read_text(encoding="utf-8")  # noqa: ASYNC240
-        == "mock transcript for https://www.youtube.com/watch?v=video1\n"
+    transcript_text = Path(after.transcript_path).read_text(encoding="utf-8")  # noqa: ASYNC240
+    expected = (
+        f"mock transcript for https://www.youtube.com/watch?v=video1 "
+        f"(job_id={job.job_id})\n"
     )
+    assert transcript_text == expected
 
 
 async def test_process_one_returns_false_when_queue_empty(
@@ -52,7 +54,7 @@ async def test_process_one_defers_retry_on_retryable_error(
     """Retryable pipeline failures schedule a retry with backoff."""
 
     class TransientFailure(MockPipeline):
-        async def transcribe(self, video_url: str) -> str:
+        async def transcribe(self, video_url: str, *, job_id: str) -> str:
             raise PipelineError("ollama disconnected", retryable=True)
 
     worker = Worker(store, TransientFailure(), settings)
@@ -76,7 +78,7 @@ async def test_process_one_marks_failed_on_non_retryable_error(
     """Non-retryable pipeline failures go straight to FAILED."""
 
     class FatalFailure(MockPipeline):
-        async def transcribe(self, video_url: str) -> str:
+        async def transcribe(self, video_url: str, *, job_id: str) -> str:
             raise PipelineError(
                 "video unavailable", code="VIDEO_UNAVAILABLE", retryable=False
             )
@@ -101,7 +103,7 @@ async def test_process_one_treats_untyped_exception_as_retryable(
     by default — defensive choice from HLD-001 §10."""
 
     class BoomPipeline(MockPipeline):
-        async def transcribe(self, video_url: str) -> str:
+        async def transcribe(self, video_url: str, *, job_id: str) -> str:
             raise RuntimeError("kaboom")
 
     worker = Worker(store, BoomPipeline(), settings)
@@ -128,7 +130,7 @@ async def test_process_one_marks_failed_after_retryable_exhausts_attempts(
     )
 
     class TransientFailure(MockPipeline):
-        async def transcribe(self, video_url: str) -> str:
+        async def transcribe(self, video_url: str, *, job_id: str) -> str:
             raise PipelineError("flaky", retryable=True)
 
     worker = Worker(store, TransientFailure(), settings)
@@ -155,8 +157,9 @@ async def test_process_one_marks_failed_after_retryable_exhausts_attempts(
     assert after is not None
     assert after.status == JobStatus.FAILED
     assert after.error is not None
-    # PipelineError("flaky", retryable=True) → code defaults to PIPELINE_TRANSIENT.
-    assert after.error.code == "PIPELINE_TRANSIENT"
+    # PipelineError("flaky", retryable=True) → code defaults to HLD-canonical
+    # FETCH_FAILED (base.py default).
+    assert after.error.code == "FETCH_FAILED"
     assert after.error.retryable is True
     assert after.attempt == 2
 

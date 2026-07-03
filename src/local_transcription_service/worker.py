@@ -116,7 +116,7 @@ class Worker:
             return True
 
         try:
-            text = await self._pipeline.transcribe(job.video_url)
+            text = await self._pipeline.transcribe(job.video_url, job_id=job.job_id)
         except Exception as exc:  # noqa: BLE001 - any pipeline failure is a job failure
             error = self._error_from_exception(exc)
             await self._handle_pipeline_failure(job, error)
