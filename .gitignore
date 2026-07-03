@@ -37,3 +37,10 @@ results/
 # Logs
 *.log
 logs/
+
+# Session-only notes / draft log files (not part of shipped docs)
+note_*.md
+docs/note_*.md
+
+# Mac Mini provisioning scripts (runbook is canonical; scripts not used)
+scripts/whisper-macmini/

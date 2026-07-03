@@ -49,36 +49,44 @@ primary target to Apple Silicon.
 
 ## 4. STT engine and model
 
-### Engine: ollama-hosted whisper  **[DECISION]**
+### Engine: whisper.cpp (Metal) behind LiteLLM  **[DECISION — amended 2026-07-03]**
 
-Two options on the table:
+> **Amendment note.** The original decision was *ollama-hosted whisper*. A B0
+> provisioning spike (2026-07-03) falsified it empirically: ollama 0.31.1 on the
+> Mac Mini returns **404** for `POST /api/audio/transcriptions`, no whisper model
+> is runnable in ollama (`ollama list` has none), and whisper STT is an open
+> upstream feature request (ollama/ollama#8202, #11798) — not a shipped API.
+> Engine changed to whisper.cpp. This stays within ADR-012 (STT remains local;
+> cloud STT still rejected) so **no ADR change is required** — the engine is an
+> HLD/operational concern.
 
-| Engine                          | Pros                                                                              | Cons                                                                              |
-|---------------------------------|-----------------------------------------------------------------------------------|-----------------------------------------------------------------------------------|
-| `ollama` (whisper-large-v3-turbo) | User already runs ollama; one `ollama pull` to install; model stays loaded between jobs; clean `/ready` probe via `GET /api/tags`. | Extra HTTP hop; tied to ollama daemon uptime; ~2-3 s slower than MLX on Apple Silicon. |
-| `mlx-whisper` (direct)          | Native Metal GPU via MLX; fastest inference on Apple Silicon; full control over inference parameters. | Second model lifecycle alongside ollama; cold start per worker boot; user must manage downloads. |
+Options considered:
 
-**Choice: ollama-hosted whisper.** The user already runs ollama on
-the Mac Mini. Operational simplicity wins over the 2-3 s inference
-delta for a 10-minute video (the inference itself takes 1-3 minutes).
-Both engines share the same `STTEngine` interface, so mlx-whisper
-remains a drop-in alternative if ollama quality or latency proves
-insufficient.
+| Engine                            | Verdict                                                                                                   |
+|-----------------------------------|----------------------------------------------------------------------------------------------------------|
+| `ollama` (whisper-large-v3-turbo) | **Rejected.** No audio-transcription endpoint; whisper not runnable in ollama; upstream feature-request only. |
+| `whisper.cpp` (Metal) via `whisper-server` | **Chosen.** Apple-Silicon first-class (Metal/Core ML), lowest latency, no LLM runtime in the STT path, native OpenAI `/v1/audio/transcriptions`. |
+| `mlx-whisper` (direct)            | Deferred alt. MLX-native; kept as a drop-in `STTEngine` if whisper.cpp latency/quality proves insufficient. |
 
-Setup on the Mac Mini (one-time):
+**Choice: whisper.cpp `whisper-server`, fronted by the existing LiteLLM Proxy.**
+whisper-server runs loopback-only (`127.0.0.1:8779`) with `--inference-path
+/v1/audio/transcriptions`, and is registered in LiteLLM (`:4000`) as an
+`audio_transcription` deployment. The service therefore talks to **one** gateway
+with **one** token for LLM + STT, and the STT engine is swappable behind LiteLLM
+without touching Stage 3 code. Provisioning runbook + scripts:
+`docs/runbooks/whisper-macmini-provisioning.md`, `scripts/whisper-macmini/`.
 
-```bash
-ollama pull whisper-large-v3-turbo
-```
+Deployment verified 2026-07-03 on Apple M4 (4 P + 6 E cores, 16 GB): Metal
+backend active, `large-v3-turbo` (1623.92 MB) loaded, launchd-managed,
+`json` + `verbose_json` smoke green.
 
 ### Model: `whisper-large-v3-turbo`  **[DECISION, MVP default]**
 
-Selected via ollama's model name. Quality close to `large-v3`, ~6×
-faster. Fits in unified memory of any current Mac Mini.
-
-Model selection is configurable via `LTS_MODEL` env var. Switching
-model does **not** require re-architecting anything — it is a config
-choice, not a code change.
+whisper.cpp ggml model (`ggml-large-v3-turbo.bin`, ~1.6 GB). Quality close to
+`large-v3`, ~6× faster; runs on Metal within unified memory. `medium` is also
+downloaded; a `medium` vs `large-v3-turbo` benchmark (RTF, cold/warm) is an
+open optimization (`scripts/whisper-macmini/bench-whisper.sh`) — switching model
+is a config/wrapper change, not a code change.
 
 ### Engine interface  **[DECISION]**
 
@@ -90,16 +98,16 @@ class STTEngine(Protocol):
 
 Two implementations:
 
-- `OllamaWhisperSTT` (default) — POSTs WAV bytes to
-  `${LTS_OLLAMA_BASE_URL}/api/audio/transcriptions` with
-  `model=${LTS_MODEL}`. `is_ready` calls `GET /api/tags` and checks
-  the model is in the list.
-- `MLXWhisperSTT` (alt, optional dep) — Python import of
-  `mlx_whisper.transcribe()`. Loaded only when `LTS_STT_ENGINE=mlx-whisper`.
+- `LiteLLMWhisperSTT` (default) — POSTs the WAV as OpenAI multipart to
+  `${LTS_STT_BASE_URL}/audio/transcriptions` (LiteLLM `:4000/v1`) with
+  `model=${LTS_MODEL}` and the `${LTS_STT_API_KEY}` bearer. `is_ready` calls
+  `GET ${LTS_STT_BASE_URL}/models` and checks the model is listed.
+- `MockSTT` — deterministic, no I/O; used when `LTS_STT_ENGINE=mock`
+  (CI / dev environments with no gateway).
 
-Engine is selected by the `LTS_STT_ENGINE` env var (`ollama`,
-`mlx-whisper`, or `mock` for dev/test environments that do not
-have a real STT daemon running).
+Engine is selected by the `LTS_STT_ENGINE` env var (`openai` for the
+LiteLLM/whisper.cpp path, or `mock`). A future `mlx-whisper` engine can be added
+as a third value without changing the worker or Stage 1/2.
 
 ## 5. Service topology
 
@@ -146,7 +154,7 @@ Returns `200` only when all of:
 - Database file writable (`jobs.db`).
 - `ffmpeg` binary found on `$PATH`.
 - Configured STT engine reports `is_ready() == True`
-  (for ollama: model in `/api/tags` response).
+  (for the LiteLLM/whisper.cpp path: model listed in `GET /v1/models`).
 
 ```json
 {
@@ -154,7 +162,7 @@ Returns `200` only when all of:
   "checks": {
     "db_writable": true,
     "ffmpeg_present": true,
-    "stt_engine": "ollama",
+    "stt_engine": "openai",
     "stt_model_loaded": true
   }
 }
@@ -295,9 +303,9 @@ with `attempt` already incremented.
 **Lease TTL: 600 seconds**  **[DECISION]**
 
 `large-v3-turbo` inference on a 60-minute audio file at fp16 takes
-well under 10 minutes on Apple Silicon (or ~10 min via ollama
-network overhead). 600s is a generous ceiling that handles transient
-stalls (e.g., GC pauses) without false reclaims.
+well under 10 minutes on Apple Silicon (whisper.cpp on Metal). 600s
+is a generous ceiling that handles transient stalls (e.g., GC pauses)
+without false reclaims.
 
 ## 9. State machine
 
@@ -336,14 +344,14 @@ differently.
 This is a single-user interactive tool on a small compute node, not
 a batch server. Two attempts are enough to absorb the most common
 transient failures (network blip during media fetch, brief ffmpeg
-hiccup, transient ollama unavailability) without papering over
+hiccup, transient STT-gateway unavailability) without papering over
 genuine problems.
 
 Retryable errors (per ADR-012 contract):
 
 - Media fetch transient failure (network).
 - ffmpeg transient failure.
-- STT engine transient unavailability (e.g., ollama daemon restart).
+- STT engine transient unavailability (e.g., whisper-server / LiteLLM restart).
 - STT inference OOM-recoverable (e.g., after releasing other memory).
 
 Non-retryable errors:
@@ -351,8 +359,7 @@ Non-retryable errors:
 - Invalid URL.
 - Video unavailable / private / region-locked.
 - No audio track.
-- Missing STT model (not pulled into ollama).
-- Missing model weights (mlx-whisper path).
+- Missing STT model (not registered in LiteLLM).
 - Malformed request.
 
 Backoff between attempt 1 and attempt 2: **30 seconds.**
@@ -378,17 +385,17 @@ Cleans up the raw media file from Stage 1 after the WAV is produced.
 
 ### Stage 3 — Speech-to-text inference
 
-**Tool: configured `STTEngine` (default: `OllamaWhisperSTT`).**  **[DECISION]**
+**Tool: configured `STTEngine` (default: `LiteLLMWhisperSTT` → whisper.cpp).**  **[DECISION]**
 
 Sends the WAV from Stage 2 to the STT engine and receives a
 plain-text transcript. Writes the transcript to
 `${LTS_DATA_DIR}/results/{job_id}.md`.
 
-For ollama: the model stays loaded in ollama's process memory
-between jobs (cold start is once per `ollama serve` lifetime, not
-per job). Memory budget on Apple Silicon: `whisper-large-v3-turbo`
-fits in <2 GB unified memory, leaving headroom on any current Mac
-Mini (≥8 GB unified memory).
+For whisper.cpp: the model stays loaded in `whisper-server`'s memory
+between jobs (cold start is once per service lifetime, not per job).
+Memory budget on Apple Silicon: `whisper-large-v3-turbo` loads at
+~1.6 GB (verified 1623.92 MB on the M4), leaving headroom on any
+current Mac Mini (≥8 GB unified memory).
 
 ## 12. Failure modes and recovery
 
@@ -397,9 +404,9 @@ Mini (≥8 GB unified memory).
 | Service crash mid-job            | Lease expires                    | Background reclaim returns job to `queued`.                          |
 | `ffmpeg` missing                 | Subprocess exits non-zero        | Non-retryable `error`, surfaced via API.                              |
 | `yt-dlp` missing                 | Subprocess exits non-zero        | Non-retryable `error`, surfaced via API.                              |
-| Ollama daemon down               | `POST /api/audio/transcriptions` connection refused or 5xx | Retryable; reclaim returns job to `queued` after 30s backoff. |
-| Ollama model not pulled          | `/api/tags` does not list model  | Non-retryable `error` with `code=MODEL_NOT_PULLED`; user runs `ollama pull` and resubmits. |
-| mlx-whisper model file missing   | Import / load failure            | Non-retryable `error`, surfaced via API.                              |
+| STT gateway down                 | `POST /v1/audio/transcriptions` connection refused or 5xx | Retryable; reclaim returns job to `queued` after 30s backoff. |
+| STT model not registered         | `GET /v1/models` does not list model | Non-retryable `error` with `code=MODEL_NOT_PULLED`; operator registers the whisper deployment in LiteLLM and resubmits. |
+| whisper.cpp model file missing   | `whisper-server` fails to start / 5xx | launchd surfaces via `whisper-server.err`; jobs retryable until the service is healthy. |
 | Network drop during fetch        | yt-dlp exits with network error  | Retryable; backoff 30s.                                               |
 | Disk full                        | Write raises `OSError`           | Non-retryable `error`; user frees space and resubmits.                |
 | OOM during inference             | Process killed / Python raises   | Retryable; reclaim returns job to `queued`.                            |
@@ -462,7 +469,7 @@ At service startup, log the resolved configuration (token value is
 
 ```json
 {"ts": "...", "level": "INFO", "event": "config_resolved",
- "stt_engine": "ollama", "stt_model": "whisper-large-v3-turbo",
+ "stt_engine": "openai", "stt_model": "whisper-large-v3-turbo",
  "bind_host": "192.168.0.99", "bind_port": 8766,
  "data_dir": "/Users/me/.local-transcription",
  "lease_ttl_s": 600, "max_attempts": 2}
@@ -508,11 +515,11 @@ here so future readers can trace the rationale.
 
 | ID  | Question                                                                                                                       | Resolution                                                                                                                                                  |
 |-----|--------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| O-1 | STT model for MVP                                                                                                              | `whisper-large-v3-turbo` via ollama. Configurable via `LTS_MODEL`.                                                                                          |
+| O-1 | STT model for MVP                                                                                                              | `whisper-large-v3-turbo` via whisper.cpp (Metal), fronted by LiteLLM. Configurable via `LTS_MODEL`.                                                          |
 | O-2 | LAN access needed? What auth?                                                                                                  | **LAN access needed.** Bind to Mac Mini LAN IP (`192.168.0.99:8766`). Auth = shared secret via `X-Auth-Token` header + `LTS_AUTH_TOKEN` env.              |
 | O-3 | Audio sources beyond YouTube URLs                                                                                              | YouTube URLs only for MVP. Direct file URL / upload is a future HLD.                                                                                         |
 | O-4 | Result retention policy                                                                                                        | Move to `${LTS_DATA_DIR}/trash/{job_id}.md` after the extension confirms download via `GET /jobs/{id}/ack`. Manual cleanup of `trash/` thereafter.        |
-| O-5 | Healthcheck depth: add `/ready`?                                                                                                | **Yes.** Verifies DB writable, `ffmpeg` present, STT engine ready (ollama model in `/api/tags`, or mlx-whisper loaded).                                    |
+| O-5 | Healthcheck depth: add `/ready`?                                                                                                | **Yes.** Verifies DB writable, `ffmpeg` present, STT engine ready (whisper model listed in LiteLLM `GET /v1/models`).                                       |
 | O-6 | Rate-limit on submission                                                                                                       | Trust the `X-Auth-Token` — token holder is the legitimate single user. No IP-based limit for MVP.                                                            |
 
 ## 18. Out of scope for this HLD

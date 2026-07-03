@@ -97,9 +97,9 @@ curl http://192.168.0.99:8766/jobs/$JOB_ID -H "X-Auth-Token: $LTS_AUTH_TOKEN"
 | `LTS_BIND_HOST`        | `192.168.0.99`           | §14         | LAN IP of the Mac Mini. |
 | `LTS_PORT`             | `8766`                   | §14         | TCP port. |
 | `LTS_DATA_DIR`         | `~/.local-transcription` | §7, §13     | Holds `jobs.db`, `audio-cache/`, `results/`, `trash/`. |
-| `LTS_STT_ENGINE`       | `ollama`                 | §4          | `ollama` / `mlx-whisper` / `mock` (dev only). |
+| `LTS_STT_ENGINE`       | `ollama`                 | §4          | Phase A default. **HLD §4 amended → migrates to `openai` in Phase B (B3).** |
 | `LTS_MODEL`            | `whisper-large-v3-turbo` | §4          | Model name passed to the STT engine. |
-| `LTS_OLLAMA_BASE_URL`  | `http://127.0.0.1:11434` | §4          | ollama daemon URL. |
+| `LTS_OLLAMA_BASE_URL`  | `http://127.0.0.1:11434` | §4          | Phase A only. **B3 replaces with `LTS_STT_BASE_URL` (LiteLLM `…:4000/v1`) + `LTS_STT_API_KEY`.** |
 | `LTS_LEASE_TTL_SECONDS`| `600`                    | §8          | Worker lease before reclaim. |
 | `LTS_RECLAIM_INTERVAL_SECONDS` | `30`             | §8          | How often the reclaim loop runs. |
 | `LTS_MAX_ATTEMPTS`     | `2`                      | §10         | Max processing attempts per job. |
@@ -118,17 +118,26 @@ curl http://192.168.0.99:8766/jobs/$JOB_ID -H "X-Auth-Token: $LTS_AUTH_TOKEN"
 - ✅ Background worker (`claim` + `reclaim` loops in the same event loop as uvicorn).
 - ✅ 74 tests passing, `ruff check` clean.
 
-**Pending (Phase B / C):**
+**STT engine decided (2026-07-03, HLD §4 amended):** whisper.cpp (Metal) on the
+Mac Mini, fronted by the existing LiteLLM Proxy (`:4000`) via OpenAI
+`/v1/audio/transcriptions`. The ollama path was rejected (no whisper STT
+endpoint). whisper-server is provisioned and live on `127.0.0.1:8779`
+(launchd, Apple M4, `large-v3-turbo`). See
+`docs/runbooks/whisper-macmini-provisioning.md` and `scripts/whisper-macmini/`.
 
-- ⏳ Real ollama-backed pipeline (Stage 1 yt-dlp → Stage 2 ffmpeg → Stage 3 ollama HTTP).
-- ⏳ mlx-whisper optional pipeline (Apple Silicon only).
-- ⏳ Mac Mini launchd wiring (Phase C: real `uv sync --extra stt-apple`, plist filled in).
-- ⏳ Result trash policy (HLD O-4): move to `trash/` after extension ack.
+**Pending (Phase B):**
+
+- ⏳ Real pipeline: Stage 1 yt-dlp → Stage 2 ffmpeg (16 kHz mono WAV) → Stage 3
+  `LiteLLMWhisperSTT` (OpenAI multipart to LiteLLM). See `docs/tasks/TASK-B-real-pipeline.md`.
+- ⏳ Config migration: `LTS_OLLAMA_BASE_URL` → `LTS_STT_BASE_URL` + `LTS_STT_API_KEY`,
+  `LTS_STT_ENGINE=openai` (B3).
+- ⏳ `medium` vs `large-v3-turbo` benchmark (`scripts/whisper-macmini/bench-whisper.sh`).
+- ⏳ Result trash policy (HLD O-4): move to `trash/` after extension ack (separate task).
 
 ## Requirements
 
 - Python 3.12
 - `ffmpeg` on `$PATH` (Stage 2 audio conditioning, plus `/ready` probe)
-- For STT: ollama running with the configured model pulled
-  (`ollama pull whisper-large-v3-turbo`), OR mlx-whisper weights
-  (Phase C)
+- For STT: reachable LiteLLM gateway (`http://192.168.0.99:4000`) with the
+  whisper.cpp `audio_transcription` deployment registered; `LTS_STT_API_KEY`
+  set to the LiteLLM master key. CI uses `stt_engine=mock` (no gateway needed).
