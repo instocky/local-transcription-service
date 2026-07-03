@@ -11,13 +11,16 @@ to reach the endpoint without sharing secrets.
       "checks": {
         "db_writable": true,
         "ffmpeg_present": true,
-        "stt_engine": "ollama",
+        "stt_engine": "openai",
         "stt_model_loaded": true
       }
     }
 
-The STT check dispatches on `settings.stt_engine` so mlx-whisper
-deployments don't get probed against ollama (and vice versa).
+The STT check dispatches on `settings.stt_engine`. Under the
+LiteLLM contract (`stt_engine == "openai"`) the probe hits
+`{stt_base_url}/models` with the configured bearer token and
+confirms `stt_model` is registered; under `mock` it short-circuits
+to ready (no external dependency).
 """
 
 from __future__ import annotations
@@ -26,7 +29,6 @@ import asyncio
 import logging
 import shutil
 from dataclasses import dataclass
-from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Depends, Request, status
@@ -51,7 +53,7 @@ class ReadinessReport:
 
     db_writable: bool
     ffmpeg_present: bool
-    stt_engine: str  # "ollama" | "mlx-whisper" | "mock"
+    stt_engine: str  # "openai" | "mock"
     stt_model_loaded: bool
 
     @property
@@ -103,42 +105,33 @@ async def _check_ffmpeg() -> bool:
         return proc.returncode == 0
 
 
-async def _check_ollama_model(base_url: str, model: str) -> bool:
-    """GET `{ollama}/api/tags` and confirm the configured model is loaded.
+async def _check_openai_model(base_url: str, model: str, api_key: str) -> bool:
+    """Confirm `model` is served by the OpenAI-compatible STT gateway.
 
-    `model` may include a tag suffix (e.g. `whisper-large-v3-turbo:q5`);
-    we compare on the bare name so the check tolerates the user's
-    quantization choice.
+    Pings ``{base_url}/models`` with the configured bearer token.
+    The list is the standard OpenAI response (`{"data": [{"id": ...}]}`);
+    LiteLLM Proxy forwards it as-is. We compare on the bare name so a
+    tag-style identifier (e.g. ``whisper-large-v3-turbo:q5``) still
+    matches the registered deployment.
     """
-    url = f"{base_url.rstrip('/')}/api/tags"
+    url = f"{base_url.rstrip('/')}/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     target = model.split(":")[0]
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(url)
+            response = await client.get(url, headers=headers)
         if response.status_code != 200:
             return False
         payload = response.json()
     except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("readiness: ollama model check failed: %s", exc)
+        logger.warning("readiness: openai model check failed: %s", exc)
         return False
-    models = [m.get("name", "").split(":")[0] for m in payload.get("models", [])]
+    models: list[str] = []
+    for entry in payload.get("data", []):
+        model_id = entry.get("id", "")
+        if model_id:
+            models.append(model_id.split(":")[0])
     return target in models
-
-
-async def _check_mlx_whisper_model(path: Path | None) -> bool:
-    """mlx-whisper readiness: the model file exists and is readable.
-
-    The path is configured via `LTS_STT_MODEL_PATH`; if not set we
-    report not-ready (rather than guessing a default location).
-    """
-    if path is None:
-        return False
-    try:
-        exists = await asyncio.to_thread(path.is_file)
-    except OSError as exc:
-        logger.warning("readiness: mlx-whisper model check failed: %s", exc)
-        return False
-    return exists
 
 
 async def _check_stt_engine(settings: Settings) -> bool:
@@ -146,10 +139,10 @@ async def _check_stt_engine(settings: Settings) -> bool:
     if settings.stt_engine == "mock":
         # Mock pipeline is in-process; no external dependency to probe.
         return True
-    if settings.stt_engine == "ollama":
-        return await _check_ollama_model(settings.ollama_base_url, settings.stt_model)
-    if settings.stt_engine == "mlx-whisper":
-        return await _check_mlx_whisper_model(settings.stt_model_path)
+    if settings.stt_engine == "openai":
+        return await _check_openai_model(
+            settings.stt_base_url, settings.stt_model, settings.stt_api_key
+        )
     logger.warning("readiness: unknown stt_engine=%r", settings.stt_engine)
     return False
 
