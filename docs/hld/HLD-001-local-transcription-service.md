@@ -2,10 +2,10 @@
 
 | Field      | Value                                          |
 |------------|------------------------------------------------|
-| Status     | Draft                                          |
+| Status     | Accepted                                       |
 | Date       | 2026-07-03                                     |
 | Author     | Mavis                                          |
-| Deciders   | TBD                                            |
+| Deciders   | Mavis, Senior Tech Lead                        |
 | Supersedes | —                                              |
 | Related    | ADR-012 (system-level, extension repo)         |
 
@@ -26,11 +26,10 @@ The boundary test for this document:
 
 ## 2. Deployment target
 
-**Primary:** Mac Mini, Apple Silicon (M-series), macOS.
-
-The service binds to `127.0.0.1` by default and is intended to run
-under `launchd` on the same machine as the user's Chrome browser
-with the YT Transcript Copier extension installed.
+**Primary:** Mac Mini, Apple Silicon (M-series), macOS, LAN IP
+`192.168.0.99`. The service runs under `launchd` on the Mac Mini
+and is reached over LAN by the user's Windows dev box (which runs
+the Chrome browser with the YT Transcript Copier extension).
 
 Hardware-agnosticism is preserved at the architectural level
 (ADR-012) — a Jetson or Linux mini-PC could host this service with
@@ -50,32 +49,57 @@ primary target to Apple Silicon.
 
 ## 4. STT engine and model
 
-### Engine: mlx-whisper  **[DECISION]**
+### Engine: ollama-hosted whisper  **[DECISION]**
 
 Two options on the table:
 
-| Engine          | Pros                                                          | Cons                                                  |
-|-----------------|---------------------------------------------------------------|-------------------------------------------------------|
-| `mlx-whisper`   | Native Metal GPU acceleration on Apple Silicon; fastest.     | Locks primary target to Apple Silicon.                |
-| `faster-whisper`| Portable across macOS / Linux / Windows; CPU + CUDA paths.   | Slower than MLX on Apple Silicon.                     |
+| Engine                          | Pros                                                                              | Cons                                                                              |
+|---------------------------------|-----------------------------------------------------------------------------------|-----------------------------------------------------------------------------------|
+| `ollama` (whisper-large-v3-turbo) | User already runs ollama; one `ollama pull` to install; model stays loaded between jobs; clean `/ready` probe via `GET /api/tags`. | Extra HTTP hop; tied to ollama daemon uptime; ~2-3 s slower than MLX on Apple Silicon. |
+| `mlx-whisper` (direct)          | Native Metal GPU via MLX; fastest inference on Apple Silicon; full control over inference parameters. | Second model lifecycle alongside ollama; cold start per worker boot; user must manage downloads. |
 
-**Choice: mlx-whisper.** ADR-012 already commits to a Mac Mini as the
-current compute node. Apple Silicon is the primary target; portability
-is a property of the architectural contract, not the implementation.
-Cross-platform portability is opt-in via a future engine swap (the
-service exposes engine selection behind a single interface).
+**Choice: ollama-hosted whisper.** The user already runs ollama on
+the Mac Mini. Operational simplicity wins over the 2-3 s inference
+delta for a 10-minute video (the inference itself takes 1-3 minutes).
+Both engines share the same `STTEngine` interface, so mlx-whisper
+remains a drop-in alternative if ollama quality or latency proves
+insufficient.
 
-### Model size: large-v3-turbo  **[DECISION, MVP default]**
+Setup on the Mac Mini (one-time):
 
-Default model for MVP: `mlx-community/whisper-large-v3-turbo`.
+```bash
+ollama pull whisper-large-v3-turbo
+```
 
-- Quality close to `large-v3`.
-- ~6× faster than `large-v3` on Apple Silicon.
-- Fits in unified memory of any current Mac Mini.
+### Model: `whisper-large-v3-turbo`  **[DECISION, MVP default]**
+
+Selected via ollama's model name. Quality close to `large-v3`, ~6×
+faster. Fits in unified memory of any current Mac Mini.
 
 Model selection is configurable via `LTS_MODEL` env var. Switching
 model does **not** require re-architecting anything — it is a config
 choice, not a code change.
+
+### Engine interface  **[DECISION]**
+
+```python
+class STTEngine(Protocol):
+    async def transcribe(self, wav_path: Path, *, language: str | None = None) -> str: ...
+    async def is_ready(self) -> bool: ...
+```
+
+Two implementations:
+
+- `OllamaWhisperSTT` (default) — POSTs WAV bytes to
+  `${LTS_OLLAMA_BASE_URL}/api/audio/transcriptions` with
+  `model=${LTS_MODEL}`. `is_ready` calls `GET /api/tags` and checks
+  the model is in the list.
+- `MLXWhisperSTT` (alt, optional dep) — Python import of
+  `mlx_whisper.transcribe()`. Loaded only when `LTS_STT_ENGINE=mlx-whisper`.
+
+Engine is selected by the `LTS_STT_ENGINE` env var (`ollama`,
+`mlx-whisper`, or `mock` for dev/test environments that do not
+have a real STT daemon running).
 
 ## 5. Service topology
 
@@ -100,13 +124,44 @@ configuration change, not a redesign:
 All endpoints under `/`. JSON in, JSON out. Identifiers are opaque
 strings (UUIDv4 by default).
 
+All endpoints (except `GET /health` and `GET /ready`) require the
+`X-Auth-Token: ${LTS_AUTH_TOKEN}` header. Missing or mismatched
+token → `401 Unauthorized`. No body, no retry hint.
+
 ### `GET /health`
 
-Liveness probe.
+Liveness probe. **No auth required.**
 
 ```json
 { "status": "ok", "version": "0.1.0" }
 ```
+
+### `GET /ready`
+
+Readiness probe. **No auth required** (so dev monitoring can poll
+without managing tokens).
+
+Returns `200` only when all of:
+
+- Database file writable (`jobs.db`).
+- `ffmpeg` binary found on `$PATH`.
+- Configured STT engine reports `is_ready() == True`
+  (for ollama: model in `/api/tags` response).
+
+```json
+{
+  "ready": true,
+  "checks": {
+    "db_writable": true,
+    "ffmpeg_present": true,
+    "stt_engine": "ollama",
+    "stt_model_loaded": true
+  }
+}
+```
+
+When any check fails, returns `503 Service Unavailable` with the
+same payload structure and the failing check set to `false`.
 
 ### `POST /jobs`
 
@@ -240,9 +295,9 @@ with `attempt` already incremented.
 **Lease TTL: 600 seconds**  **[DECISION]**
 
 `large-v3-turbo` inference on a 60-minute audio file at fp16 takes
-well under 10 minutes on Apple Silicon. 600s is a generous ceiling
-that handles transient stalls (e.g., GC pauses) without false
-reclaims.
+well under 10 minutes on Apple Silicon (or ~10 min via ollama
+network overhead). 600s is a generous ceiling that handles transient
+stalls (e.g., GC pauses) without false reclaims.
 
 ## 9. State machine
 
@@ -281,12 +336,14 @@ differently.
 This is a single-user interactive tool on a small compute node, not
 a batch server. Two attempts are enough to absorb the most common
 transient failures (network blip during media fetch, brief ffmpeg
-hiccup) without papering over genuine problems.
+hiccup, transient ollama unavailability) without papering over
+genuine problems.
 
 Retryable errors (per ADR-012 contract):
 
 - Media fetch transient failure (network).
 - ffmpeg transient failure.
+- STT engine transient unavailability (e.g., ollama daemon restart).
 - STT inference OOM-recoverable (e.g., after releasing other memory).
 
 Non-retryable errors:
@@ -294,7 +351,8 @@ Non-retryable errors:
 - Invalid URL.
 - Video unavailable / private / region-locked.
 - No audio track.
-- Missing model weights.
+- Missing STT model (not pulled into ollama).
+- Missing model weights (mlx-whisper path).
 - Malformed request.
 
 Backoff between attempt 1 and attempt 2: **30 seconds.**
@@ -320,26 +378,32 @@ Cleans up the raw media file from Stage 1 after the WAV is produced.
 
 ### Stage 3 — Speech-to-text inference
 
-**Tool: `mlx-whisper` (Python import).**  **[DECISION]**
+**Tool: configured `STTEngine` (default: `OllamaWhisperSTT`).**  **[DECISION]**
 
-Loads the configured model on first use and keeps it resident in
-memory for the lifetime of the process. Writes the transcript to
+Sends the WAV from Stage 2 to the STT engine and receives a
+plain-text transcript. Writes the transcript to
 `${LTS_DATA_DIR}/results/{job_id}.md`.
 
-Model memory budget: large-v3-turbo fits in <2 GB on Apple Silicon,
-leaving headroom on any current Mac Mini (≥8 GB unified memory).
+For ollama: the model stays loaded in ollama's process memory
+between jobs (cold start is once per `ollama serve` lifetime, not
+per job). Memory budget on Apple Silicon: `whisper-large-v3-turbo`
+fits in <2 GB unified memory, leaving headroom on any current Mac
+Mini (≥8 GB unified memory).
 
 ## 12. Failure modes and recovery
 
 | Failure                          | Detection                        | Recovery                                                              |
 |----------------------------------|----------------------------------|-----------------------------------------------------------------------|
 | Service crash mid-job            | Lease expires                    | Background reclaim returns job to `queued`.                          |
-| ffmpeg missing                   | Subprocess exits non-zero        | Non-retryable `error`, surfaced via API.                              |
-| yt-dlp missing                   | Subprocess exits non-zero        | Non-retryable `error`, surfaced via API.                              |
-| Model file missing               | Import / load failure            | Non-retryable `error`, surfaced via API.                              |
+| `ffmpeg` missing                 | Subprocess exits non-zero        | Non-retryable `error`, surfaced via API.                              |
+| `yt-dlp` missing                 | Subprocess exits non-zero        | Non-retryable `error`, surfaced via API.                              |
+| Ollama daemon down               | `POST /api/audio/transcriptions` connection refused or 5xx | Retryable; reclaim returns job to `queued` after 30s backoff. |
+| Ollama model not pulled          | `/api/tags` does not list model  | Non-retryable `error` with `code=MODEL_NOT_PULLED`; user runs `ollama pull` and resubmits. |
+| mlx-whisper model file missing   | Import / load failure            | Non-retryable `error`, surfaced via API.                              |
 | Network drop during fetch        | yt-dlp exits with network error  | Retryable; backoff 30s.                                               |
 | Disk full                        | Write raises `OSError`           | Non-retryable `error`; user frees space and resubmits.                |
 | OOM during inference             | Process killed / Python raises   | Retryable; reclaim returns job to `queued`.                            |
+| Wrong / missing X-Auth-Token     | API request missing header       | `401 Unauthorized`. No job state change.                              |
 
 ## 13. Result storage
 
@@ -354,26 +418,54 @@ Retention policy: **see Open Decision O-4 below.**
 
 ## 14. Network binding and auth
 
-**Default bind: `127.0.0.1:8766`, no auth.**  **[DECISION]**
+**Default bind: `192.168.0.99:8766` (the Mac Mini's LAN IP).**  **[DECISION]**
 
-Threat model: same machine as the user's Chrome browser. The
-extension talks to the service over loopback HTTP. Loopback-only
-binding eliminates the LAN attack surface.
+The service binds to the Mac Mini's LAN address, not `0.0.0.0` and
+not `127.0.0.1`. The Windows dev box reaches the service at
+`http://192.168.0.99:8766`.
 
-For LAN access, an explicit auth scheme (token / mTLS) is required
-before binding to a non-loopback address. This is **out of scope
-for MVP**; see Open Decision O-2.
+Bind address is overridable via `LTS_BIND_HOST` env var (e.g., for
+future loopback-only testing: `LTS_BIND_HOST=127.0.0.1`). Port is
+`LTS_PORT`, default `8766`.
+
+**Auth: shared secret token via `X-Auth-Token` header.**  **[DECISION]**
+
+- Token configured via `LTS_AUTH_TOKEN` env var on both the Mac Mini
+  (in the launchd plist) and the Windows dev box (in the extension
+  settings or `background.js` config).
+- All endpoints except `GET /health` and `GET /ready` require the
+  header. Mismatch → `401 Unauthorized`.
+- Token rotation: change the env var on both sides and restart the
+  service. No version field; one active token at a time.
+- For MVP, no expiry. If the token is suspected leaked, rotate.
+
+Threat model: home LAN, single user. The token prevents accidental
+discovery and access from other devices on the same network; it is
+not a substitute for transport encryption (which is out of scope
+for MVP — see Section 18).
 
 ## 15. Logging
 
 **Structured JSON to stdout.**  **[DECISION]**
 
 One log line per event (job submitted, job claimed, stage started,
-stage finished, job done, job failed). Fields:
+stage finished, job done, job failed, STT engine choice at startup).
+Fields:
 
 ```json
 {"ts": "...", "level": "INFO", "job_id": "...", "stage": "fetch",
  "event": "stage_finished", "duration_s": 4.2}
+```
+
+At service startup, log the resolved configuration (token value is
+**never** logged):
+
+```json
+{"ts": "...", "level": "INFO", "event": "config_resolved",
+ "stt_engine": "ollama", "stt_model": "whisper-large-v3-turbo",
+ "bind_host": "192.168.0.99", "bind_port": 8766,
+ "data_dir": "/Users/me/.local-transcription",
+ "lease_ttl_s": 600, "max_attempts": 2}
 ```
 
 `launchd` captures stdout/stderr to a file under
@@ -399,24 +491,29 @@ The plist:
 - Runs on user login (`RunAtLoad`).
 - Restarts on crash (`KeepAlive`).
 - Sets working directory to the repo root.
-- Reads `LTS_*` env vars from `~/.local-transcription/env`.
+- Inlines all `LTS_*` env vars directly under `EnvironmentVariables`.
+  **launchd does NOT source external env files** — the plist must
+  carry each variable explicitly. Operators who prefer the
+  `~/.local-transcription/env` pattern can substitute a wrapper
+  script that sources the file and execs `local-transcription-service`;
+  the default plist does not.
 
 For Linux/Jetson (future target), the equivalent would be a systemd
 unit — same operational pattern, different syntax.
 
-## 17. Open decisions (require user input before implementation)
+## 17. Resolved decisions
 
-These are decisions where reasonable defaults are documented above
-but a confirmation is needed before code is written against them.
+The following decisions were resolved during planning. Recorded
+here so future readers can trace the rationale.
 
-| ID  | Question                                                                                                                                       |
-|-----|------------------------------------------------------------------------------------------------------------------------------------------------|
-| O-1 | Confirm STT model: `large-v3-turbo` for MVP? Switch to `large-v3` if quality is insufficient, or `small`/`medium` if latency matters more?    |
-| O-2 | LAN access needed for MVP? If yes, what auth scheme (token / mTLS / SSH-tunnel-only)?                                                         |
-| O-3 | Audio sources beyond YouTube URLs: direct file upload? Arbitrary URL? Or strictly YouTube?                                                    |
-| O-4 | Result retention policy: delete after N days, keep forever until manual cleanup, or move to a `trash/` directory after download?              |
-| O-5 | Healthcheck depth: current `/health` only confirms liveness. Add a `ready` endpoint that verifies model loaded + DB writable + ffmpeg present? |
-| O-6 | Concurrent job submission from the same extension (e.g., two tabs both submitting)? Rate-limit per job_id, per IP, or just trust loopback?     |
+| ID  | Question                                                                                                                       | Resolution                                                                                                                                                  |
+|-----|--------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| O-1 | STT model for MVP                                                                                                              | `whisper-large-v3-turbo` via ollama. Configurable via `LTS_MODEL`.                                                                                          |
+| O-2 | LAN access needed? What auth?                                                                                                  | **LAN access needed.** Bind to Mac Mini LAN IP (`192.168.0.99:8766`). Auth = shared secret via `X-Auth-Token` header + `LTS_AUTH_TOKEN` env.              |
+| O-3 | Audio sources beyond YouTube URLs                                                                                              | YouTube URLs only for MVP. Direct file URL / upload is a future HLD.                                                                                         |
+| O-4 | Result retention policy                                                                                                        | Move to `${LTS_DATA_DIR}/trash/{job_id}.md` after the extension confirms download via `GET /jobs/{id}/ack`. Manual cleanup of `trash/` thereafter.        |
+| O-5 | Healthcheck depth: add `/ready`?                                                                                                | **Yes.** Verifies DB writable, `ffmpeg` present, STT engine ready (ollama model in `/api/tags`, or mlx-whisper loaded).                                    |
+| O-6 | Rate-limit on submission                                                                                                       | Trust the `X-Auth-Token` — token holder is the legitimate single user. No IP-based limit for MVP.                                                            |
 
 ## 18. Out of scope for this HLD
 
@@ -426,7 +523,7 @@ own HLD or ADR:
 - Translation of transcripts.
 - Speaker diarization.
 - Multi-worker scaling (architecturally supported, not enabled).
-- LAN / remote network access.
+- TLS / transport encryption (LAN only; out of scope for MVP).
 - Persistent transcript indexing / search.
 - Cloud STT fallback.
 - Web UI / dashboard.

@@ -20,13 +20,26 @@
     <key>WorkingDirectory</key>
     <string>__REPLACE_WITH_REPO_ROOT__</string>
 
-    <!-- Service-specific env. Override or extend per-host. -->
+    <!-- launchd does not source ~/.local-transcription/env implicitly.
+         Put every required LTS_* setting here or launch through a wrapper. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>LTS_BIND_HOST</key>
+        <string>192.168.0.99</string>
+        <key>LTS_PORT</key>
+        <string>8766</string>
         <key>LTS_DATA_DIR</key>
         <string>__REPLACE_WITH_DATA_DIR__</string>
+        <key>LTS_AUTH_TOKEN</key>
+        <string>__REPLACE_WITH_AUTH_TOKEN__</string>
+        <key>LTS_STT_ENGINE</key>
+        <string>ollama</string>
+        <key>LTS_MODEL</key>
+        <string>whisper-large-v3-turbo</string>
+        <key>LTS_OLLAMA_BASE_URL</key>
+        <string>http://127.0.0.1:11434</string>
     </dict>
 
     <!-- Run on user login; restart on crash. -->
