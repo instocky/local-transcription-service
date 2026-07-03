@@ -16,11 +16,11 @@ to reach the endpoint without sharing secrets.
       }
     }
 
-The STT check dispatches on `settings.stt_engine`. Under the
-LiteLLM contract (`stt_engine == "openai"`) the probe hits
-`{stt_base_url}/models` with the configured bearer token and
-confirms `stt_model` is registered; under `mock` it short-circuits
-to ready (no external dependency).
+The STT check delegates to ``STTEngine.is_ready()`` on the engine
+instance held by the configured pipeline (TASK-B §B4). This makes
+the engine the single source of truth: adding a new engine
+implementation later (e.g. ``mlx-whisper``) does not require
+editing this module.
 """
 
 from __future__ import annotations
@@ -30,12 +30,12 @@ import logging
 import shutil
 from dataclasses import dataclass
 
-import httpx
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
 
 from local_transcription_service import __version__
 from local_transcription_service.config import Settings
+from local_transcription_service.pipeline.base import TranscriptionPipeline
 from local_transcription_service.queue.store import JobStore
 
 logger = logging.getLogger(__name__)
@@ -105,46 +105,43 @@ async def _check_ffmpeg() -> bool:
         return proc.returncode == 0
 
 
-async def _check_openai_model(base_url: str, model: str, api_key: str) -> bool:
-    """Confirm `model` is served by the OpenAI-compatible STT gateway.
+async def _check_stt_engine(
+    pipeline: TranscriptionPipeline | None,
+    settings: Settings,
+) -> tuple[str, bool]:
+    """Probe the configured STT engine via its instance method (TASK-B §B4).
 
-    Pings ``{base_url}/models`` with the configured bearer token.
-    The list is the standard OpenAI response (`{"data": [{"id": ...}]}`);
-    LiteLLM Proxy forwards it as-is. We compare on the bare name so a
-    tag-style identifier (e.g. ``whisper-large-v3-turbo:q5``) still
-    matches the registered deployment.
+    Returns ``(stt_engine_label, stt_model_loaded)``:
+
+    - ``stt_engine_label`` is reported back to the client so
+      operators can confirm which backend the running service is
+      wired against. It comes from ``settings.stt_engine`` — the
+      config flag — not the engine's runtime class, so it stays
+      aligned with the operator-facing contract.
+    - ``stt_model_loaded`` is whatever the engine's own
+      :meth:`is_ready` reports. The ``STTEngine`` protocol
+      guarantees ``is_ready`` does not raise (a gateway outage
+      returns ``False``, never an exception), so we don't have to
+      wrap this call.
+
+    The previous implementation dispatched inline on
+    ``settings.stt_engine`` (``ollama`` / ``mlx-whisper`` / ``mock``).
+    That has been replaced: there is one source of truth now — the
+    engine itself. Adding a new engine implementation later does
+    not require touching this module.
     """
-    url = f"{base_url.rstrip('/')}/models"
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    target = model.split(":")[0]
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(url, headers=headers)
-        if response.status_code != 200:
-            return False
-        payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("readiness: openai model check failed: %s", exc)
-        return False
-    models: list[str] = []
-    for entry in payload.get("data", []):
-        model_id = entry.get("id", "")
-        if model_id:
-            models.append(model_id.split(":")[0])
-    return target in models
-
-
-async def _check_stt_engine(settings: Settings) -> bool:
-    """Dispatch the STT check on the configured engine (HLD-001 §8)."""
-    if settings.stt_engine == "mock":
-        # Mock pipeline is in-process; no external dependency to probe.
-        return True
-    if settings.stt_engine == "openai":
-        return await _check_openai_model(
-            settings.stt_base_url, settings.stt_model, settings.stt_api_key
-        )
-    logger.warning("readiness: unknown stt_engine=%r", settings.stt_engine)
-    return False
+    label = settings.stt_engine
+    if pipeline is None:
+        # No pipeline wired (tests sometimes construct a bare app).
+        logger.warning("readiness: no pipeline configured; reporting STT not ready")
+        return label, False
+    engine = getattr(pipeline, "engine", None)
+    if engine is None:
+        # Defensive fallback for a pipeline that hasn't exposed the
+        # ``engine`` property (e.g. a future custom subclass).
+        logger.warning("readiness: pipeline has no engine; reporting STT not ready")
+        return label, False
+    return label, await engine.is_ready()
 
 
 # ---------- route + dependency ----------
@@ -158,15 +155,16 @@ async def build_readiness_report(request: Request) -> ReadinessReport:
     """
     settings: Settings = request.app.state.settings
     store: JobStore = request.app.state.store
-    db_ok, ff_ok, stt_ok = await asyncio.gather(
+    pipeline: TranscriptionPipeline | None = getattr(request.app.state, "pipeline", None)
+    db_ok, ff_ok, (stt_label, stt_ok) = await asyncio.gather(
         _check_db_writable(store),
         _check_ffmpeg(),
-        _check_stt_engine(settings),
+        _check_stt_engine(pipeline, settings),
     )
     return ReadinessReport(
         db_writable=db_ok,
         ffmpeg_present=ff_ok,
-        stt_engine=settings.stt_engine,
+        stt_engine=stt_label,
         stt_model_loaded=stt_ok,
     )
 

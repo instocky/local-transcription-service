@@ -328,6 +328,19 @@ class RealPipeline(TranscriptionPipeline):
         self._ytdlp_bin = ytdlp_bin
         self._ffmpeg_bin = ffmpeg_bin
 
+    @property
+    def engine(self) -> STTEngine:
+        """The Stage 3 STT engine this pipeline delegates to.
+
+        Exposed publicly so the ``/ready`` probe can call
+        ``engine.is_ready()`` (HLD-001 §8) without reaching into
+        private state. The engine is the source of truth for
+        "model loaded" — adding a new ``STTEngine`` implementation
+        (e.g. ``mlx-whisper`` later) doesn't require touching
+        ``api/health.py``.
+        """
+        return self._stt_engine
+
     async def transcribe(self, video_url: str, *, job_id: str) -> str:
         """Run Stage 1 → Stage 2 → Stage 3 and clean up on every path."""
         cache_dir = self._audio_cache_dir

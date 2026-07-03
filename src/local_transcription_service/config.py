@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DEFAULT_DATA_DIR = Path.home() / ".local-transcription"
@@ -49,7 +49,10 @@ class Settings(BaseSettings):
 
     # --- Network binding (HLD-001 §14) ---
     bind_host: str = "192.168.0.99"
-    bind_port: int = Field(default=8766, validation_alias="LTS_PORT")
+    bind_port: int = Field(
+        default=8766,
+        validation_alias=AliasChoices("LTS_PORT", "bind_port"),
+    )
 
     # --- Auth (HLD-001 §14) ---
     # Required. No default. Minimum 16 chars to prevent trivial tokens.
@@ -72,7 +75,7 @@ class Settings(BaseSettings):
     stt_api_key: str = ""  # LTS_STT_API_KEY — empty is fine when engine=mock
     stt_model: str = Field(
         default="whisper-large-v3-turbo",
-        validation_alias="LTS_MODEL",
+        validation_alias=AliasChoices("LTS_MODEL", "stt_model"),
     )
 
     @property
