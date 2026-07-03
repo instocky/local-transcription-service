@@ -127,6 +127,7 @@ async def test_process_one_marks_failed_after_retryable_exhausts_attempts(
         reclaim_interval_seconds=settings.reclaim_interval_seconds,
         max_attempts=2,
         retry_backoff_seconds=0,  # speed up the test
+        stt_engine="mock",  # B5a: avoid openai-requires-api-key validator
     )
 
     class TransientFailure(MockPipeline):

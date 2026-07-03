@@ -26,13 +26,20 @@ AUTH_TOKEN = "test-token-aaaaaaaaaa"
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    """Settings pointed at a per-test data directory."""
+    """Settings pointed at a per-test data directory.
+
+    Tests use `MockPipeline()` (no gateway needed), so the fixture
+    pins `stt_engine='mock'` to satisfy the openai-requires-api-key
+    validator (B5a) and keep this fixture independent of any real
+    LiteLLM deployment.
+    """
     return Settings(
         auth_token=AUTH_TOKEN,
         data_dir=tmp_path,
         lease_ttl_seconds=600,
         reclaim_interval_seconds=60,
         max_attempts=2,
+        stt_engine="mock",
     )
 
 

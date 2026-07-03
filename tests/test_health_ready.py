@@ -35,7 +35,7 @@ async def test_ready_returns_200_with_checks_when_all_pass(
         ReadinessReport(
             db_writable=True,
             ffmpeg_present=True,
-            stt_engine="ollama",
+            stt_engine="openai",
             stt_model_loaded=True,
         )
     )
@@ -46,7 +46,7 @@ async def test_ready_returns_200_with_checks_when_all_pass(
         "checks": {
             "db_writable": True,
             "ffmpeg_present": True,
-            "stt_engine": "ollama",
+            "stt_engine": "openai",
             "stt_model_loaded": True,
         },
     }
@@ -59,7 +59,7 @@ async def test_ready_returns_503_when_db_unwritable(
         ReadinessReport(
             db_writable=False,
             ffmpeg_present=True,
-            stt_engine="ollama",
+            stt_engine="openai",
             stt_model_loaded=True,
         )
     )
@@ -77,7 +77,7 @@ async def test_ready_returns_503_when_ffmpeg_missing(
         ReadinessReport(
             db_writable=True,
             ffmpeg_present=False,
-            stt_engine="ollama",
+            stt_engine="openai",
             stt_model_loaded=True,
         )
     )
@@ -93,7 +93,7 @@ async def test_ready_returns_503_when_stt_model_not_loaded(
         ReadinessReport(
             db_writable=True,
             ffmpeg_present=True,
-            stt_engine="ollama",
+            stt_engine="openai",
             stt_model_loaded=False,
         )
     )
@@ -110,17 +110,17 @@ async def test_ready_includes_stt_engine_field(
         ReadinessReport(
             db_writable=True,
             ffmpeg_present=True,
-            stt_engine="mlx-whisper",
+            stt_engine="mock",
             stt_model_loaded=True,
         )
     )
     response = await client.get("/ready")
     assert response.status_code == 200
-    assert response.json()["checks"]["stt_engine"] == "mlx-whisper"
+    assert response.json()["checks"]["stt_engine"] == "mock"
 
 
 async def test_ready_does_not_require_auth(client: AsyncClient) -> None:
-    # Default dependency probes real ffmpeg/ollama; outcome is
+    # Default dependency probes real ffmpeg / STT gateway; outcome is
     # environment-dependent but must never be 401.
     response = await client.get("/ready")
     assert response.status_code in (200, 503)

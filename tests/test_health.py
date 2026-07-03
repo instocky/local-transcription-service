@@ -13,7 +13,11 @@ AUTH_TOKEN = "test-token-aaaaaaaaaa"
 
 
 async def test_health_returns_ok_and_version(tmp_path) -> None:
-    settings = Settings(auth_token=AUTH_TOKEN, data_dir=tmp_path)
+    settings = Settings(
+        auth_token=AUTH_TOKEN,
+        data_dir=tmp_path,
+        stt_engine="mock",  # no gateway in this test (B5a openai-requires-api-key)
+    )
     store = JobStore(settings.db_path)
     await store.init()
     app = create_app(settings=settings, store=store, pipeline=MockPipeline())

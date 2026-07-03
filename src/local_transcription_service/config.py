@@ -1,8 +1,8 @@
 """Service configuration loaded from LTS_* environment variables.
 
 All values come from env (via pydantic-settings). Defaults match
-HLD-001 Sections 4, 7, 14. See HLD-001 for the rationale behind
-each default.
+HLD-001 Sections 4 (amended 2026-07-03), 7, 14. See HLD-001 for the
+rationale behind each default.
 """
 
 from __future__ import annotations
@@ -10,10 +10,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DEFAULT_DATA_DIR = Path.home() / ".local-transcription"
+
+# Default STT gateway: the LiteLLM Proxy at :4000 (fronts whisper.cpp
+# + the existing LLM deployments). Stays aligned with HLD-001 §4.
+_DEFAULT_STT_BASE_URL = "http://192.168.0.99:4000/v1"
 
 
 class Settings(BaseSettings):
@@ -60,14 +64,16 @@ class Settings(BaseSettings):
     max_attempts: int = 2
     retry_backoff_seconds: int = 30
 
-    # --- STT engine (HLD-001 §4) ---
-    stt_engine: Literal["ollama", "mlx-whisper", "mock"] = "ollama"
+    # --- STT engine (HLD-001 §4, amended 2026-07-03) ---
+    # `openai` = LiteLLM/Whisper.cpp gateway (production default);
+    # `mock`   = deterministic in-process engine for CI / dev.
+    stt_engine: Literal["openai", "mock"] = "openai"
+    stt_base_url: str = _DEFAULT_STT_BASE_URL  # LTS_STT_BASE_URL
+    stt_api_key: str = ""  # LTS_STT_API_KEY — empty is fine when engine=mock
     stt_model: str = Field(
         default="whisper-large-v3-turbo",
         validation_alias="LTS_MODEL",
     )
-    stt_model_path: Path | None = None  # required for mlx-whisper readiness
-    ollama_base_url: str = "http://127.0.0.1:11434"
 
     @property
     def db_path(self) -> Path:
@@ -104,6 +110,22 @@ class Settings(BaseSettings):
             return v.expanduser().resolve()
         msg = f"unsupported type for data_dir: {type(v).__name__}"
         raise ValueError(msg)
+
+    @model_validator(mode="after")
+    def _check_openai_requires_api_key(self) -> Settings:
+        """When ``stt_engine == 'openai'`` the STT gateway call needs a
+        bearer token (the LiteLLM master key). Empty ``stt_api_key`` is
+        OK under ``mock`` because there is no network call. Without
+        this rule, ``Settings()`` would silently build a config that
+        fails on the first ``/v1/audio/transcriptions`` POST with a
+        far less obvious 401."""
+        if self.stt_engine == "openai" and not self.stt_api_key:
+            raise ValueError(
+                "stt_api_key (LTS_STT_API_KEY) is required when "
+                "stt_engine == 'openai'; set it to the LiteLLM master "
+                "key, or switch stt_engine to 'mock' for offline runs."
+            )
+        return self
 
 
 def get_settings() -> Settings:
