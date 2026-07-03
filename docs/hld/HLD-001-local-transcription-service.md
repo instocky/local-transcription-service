@@ -402,12 +402,15 @@ current Mac Mini (≥8 GB unified memory).
 | Failure                          | Detection                        | Recovery                                                              |
 |----------------------------------|----------------------------------|-----------------------------------------------------------------------|
 | Service crash mid-job            | Lease expires                    | Background reclaim returns job to `queued`.                          |
-| `ffmpeg` missing                 | Subprocess exits non-zero        | Non-retryable `error`, surfaced via API.                              |
-| `yt-dlp` missing                 | Subprocess exits non-zero        | Non-retryable `error`, surfaced via API.                              |
-| STT gateway down                 | `POST /v1/audio/transcriptions` connection refused or 5xx | Retryable; reclaim returns job to `queued` after 30s backoff. |
+| `ffmpeg` missing                 | Subprocess exits non-zero        | Non-retryable `error` with `code=AUDIO_CONDITIONING_FAILED`; surfaced via API. |
+| `ffmpeg` non-zero exit           | Subprocess exits non-zero        | Non-retryable `error` with `code=AUDIO_CONDITIONING_FAILED`; surfaced via API. |
+| `yt-dlp` missing                 | Subprocess exits non-zero        | Non-retryable `error` with `code=FETCH_FAILED`, surfaced via API.   |
+| `yt-dlp` non-zero exit           | Subprocess exits non-zero        | Non-retryable `error` with `code=FETCH_FAILED`, surfaced via API.   |
+| Network drop during fetch        | `yt-dlp` exits with network error on stderr | Retryable `error` with `code=FETCH_FAILED`; backoff 30s.    |
+| STT gateway down                 | `POST /v1/audio/transcriptions` (or preflight `GET /v1/models`) connection refused, timeout, or 5xx | Retryable `error` with `code=STT_GATEWAY_UNAVAILABLE`; reclaim returns job to `queued` after 30s backoff. |
 | STT model not registered         | `GET /v1/models` does not list model | Non-retryable `error` with `code=MODEL_NOT_PULLED`; operator registers the whisper deployment in LiteLLM and resubmits. |
+| STT request rejected (4xx)       | `POST /v1/audio/transcriptions` returns a 4xx other than model-not-registered, or a malformed/non-JSON body | Non-retryable `error` with `code=STT_BAD_REQUEST`; malformed request — fix and resubmit. |
 | whisper.cpp model file missing   | `whisper-server` fails to start / 5xx | launchd surfaces via `whisper-server.err`; jobs retryable until the service is healthy. |
-| Network drop during fetch        | yt-dlp exits with network error  | Retryable; backoff 30s.                                               |
 | Disk full                        | Write raises `OSError`           | Non-retryable `error`; user frees space and resubmits.                |
 | OOM during inference             | Process killed / Python raises   | Retryable; reclaim returns job to `queued`.                            |
 | Wrong / missing X-Auth-Token     | API request missing header       | `401 Unauthorized`. No job state change.                              |
