@@ -31,10 +31,10 @@ from local_transcription_service.pipeline.base import PipelineError
 
 logger = logging.getLogger(__name__)
 
-# TODO(b3-config): these env-var names + defaults move into
-# config.Settings (LTS_STT_BASE_URL / LTS_STT_API_KEY / LTS_MODEL) as
-# part of task b3-config. Until then LiteLLMWhisperSTT reads them
-# directly from the environment so B3 can land independently.
+# Env-var names kept here only for the dev/test fallback path
+# inside LiteLLMWhisperSTT.__init__; production reads them via
+# Settings (config.py). Mirrors config.Settings field names so the
+# two stay aligned.
 _ENV_BASE_URL = "LTS_STT_BASE_URL"
 _ENV_API_KEY = "LTS_STT_API_KEY"
 _ENV_MODEL = "LTS_MODEL"
@@ -46,7 +46,19 @@ _DEFAULT_TIMEOUT_S = 300.0
 
 
 class LiteLLMWhisperSTT:
-    """OpenAI-multipart STT client for the LiteLLM/whisper.cpp gateway."""
+    """OpenAI-multipart STT client for the LiteLLM/whisper.cpp gateway.
+
+    Constructor accepts explicit ``base_url`` / ``api_key`` / ``model``
+    arguments; production wiring goes through
+    :func:`local_transcription_service.app.build_stt_engine`, which
+    pulls them from :class:`local_transcription_service.config.Settings`.
+
+    The ``None``-fallback to ``os.environ.get(...)`` is kept only for
+    dev/test invocations that construct the client without a Settings
+    object (e.g., one-off scripts in ``scripts/whisper-macmini/``).
+    It is NOT a production path: ``Settings._check_openai_requires_api_key``
+    already validates the env vars at startup.
+    """
 
     def __init__(
         self,
