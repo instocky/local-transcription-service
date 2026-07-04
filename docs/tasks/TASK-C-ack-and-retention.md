@@ -6,7 +6,7 @@
 | Depends on  | Phase B `main` (`d492088`) — completes the result-lifecycle gap from HLD-001 O-4 |
 | HLD         | HLD-001 §13 amended (new §13.1 Lifecycle & ack); §17 O-4 corrected (GET → POST) |
 | ADR         | ADR-012 unchanged                                                            |
-| Status      | READY → IMPLEMENTING 2026-07-04                                              |
+| Status      | DONE 2026-07-04 — closed at HEAD `150c43d`                                   |
 
 ## 1. Goal
 
@@ -170,17 +170,17 @@ baseline + 31 net), per user-side pytest run 2026-07-04.
 
 ## 5. Acceptance criteria
 
-- [ ] New endpoint `POST /jobs/{job_id}/ack` returns 200 on first ack.
-- [ ] Same endpoint returns 200 + `already_acked=true` on repeat.
-- [ ] The file ends up in `${LTS_DATA_DIR}/trash/` with the source
+- [x] New endpoint `POST /jobs/{job_id}/ack` returns 200 on first ack.
+- [x] Same endpoint returns 200 + `already_acked=true` on repeat.
+- [x] The file ends up in `${LTS_DATA_DIR}/trash/` with the source
       basename preserved (typically `{job_id}.md` in MVP).
-- [ ] `GET /jobs/{id}` after ack surfaces the trash path.
-- [ ] `GET /jobs/{id}/result` after ack still streams the same content.
-- [ ] `acked_at` migration is idempotent (re-running `init()` on a
+- [x] `GET /jobs/{id}` after ack surfaces the trash path.
+- [x] `GET /jobs/{id}/result` after ack still streams the same content.
+- [x] `acked_at` migration is idempotent (re-running `init()` on a
        pre-C DB adds the column without error).
-- [ ] `uv run ruff check .` clean.
-- [ ] No new dep added; no `requirements.txt`.
-- [ ] HLD-001 §13.1 reflects the implementation; §17 O-4 says `POST`
+- [x] `uv run ruff check .` clean.
+- [x] No new dep added; no `requirements.txt`.
+- [x] HLD-001 §13.1 reflects the implementation; §17 O-4 says `POST`
        (no longer `GET`).
 
 ## 6. Report-back
@@ -192,3 +192,55 @@ introduced.
 
 If the user wants a formal gate before merge, see the
 b5-integration-gate procedure documented in TASK-B §9.
+
+---
+
+## 7. Close-out report (2026-07-04, HEAD `150c43d`)
+
+Phase C closed in a single commit on top of `d492088` (Phase B follow-up
+head). No branch, no PR — direct merge to `main` after Senior Tech
+Lead review. Verification at close time:
+
+| Gate              | Result                                                                              |
+|-------------------|-------------------------------------------------------------------------------------|
+| `uv run pytest -q`| **184 passed** in 12.40s (Phase B 153 + Phase C net +31, reconfirmed post-merge)    |
+| `uv run ruff check .` | clean                                                                            |
+| Tech Lead review  | accepted; P1 / P2 / P3 findings closed before merge                                 |
+
+### Review findings closed before merge
+
+- **P1 — DB-stale auto-discovery.** A `503` from a failed
+  `update_transcript_path` mid-flight left the DB path pointing at
+  the pre-move source while the file was already in `trash/`. Fix:
+  `move_to_trash` now falls back to a **canonical-path search**
+  (`${trash_dir}/{source.basename}`) when the source is gone but
+  the canonical trash file is present. The endpoint uses the
+  discovered destination to heal the stale DB row. Pinned by
+  `test_ack_converges_after_update_transcript_path_failure` (e2e)
+  and `test_move_to_trash_auto_discovers_when_source_missing`
+  (unit). Behaviour captured in HLD §13.1 and CHANGELOG
+  (`Auto-discovery on retry` section).
+- **P2 — `acked_at` exposure + test-count sync.** `GET /jobs/{id}`
+  now surfaces `acked_at` so the extension can confirm ack from a
+  poll cycle alone, no separate ack probe needed. Test counts
+  reconciled to the actual contract: `test_ack.py` 14 cases,
+  `test_transcripts.py` 7 cases, `test_store.py` 10 net cases;
+  total 184 = 153 (Phase B baseline) + 31 net.
+- **P3 — 503 two-sub-case wording + typo sweep.** HLD §13.1,
+  CHANGELOG (`Failure-mode contract`), and the endpoint docstring
+  all describe the **same** two-sub-case failure mode for the DB
+  path (a) `mark_acked` raises before FS work — trivial retry,
+  (b) `update_transcript_path` raises after a successful
+  `move_to_trash` — auto-discovery heals on retry. Both sub-cases
+  surface as `503 DB_UNAVAILABLE`. Three occurrences of the
+  `mark_aced` typo fixed.
+
+### Why a single commit
+
+Phase C is fully spec'd in this document (§3), the review surface
+is small (one endpoint + one store method + one FS helper), and
+the Senior Tech Lead was already on the review path. Splitting
+into multiple commits would have added rebase/round-trip cost
+without changing the diff that lands on `main`. Recorded here so
+the next task author knows it was a deliberate consolidation,
+not an oversight.

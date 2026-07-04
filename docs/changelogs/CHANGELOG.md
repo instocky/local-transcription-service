@@ -8,6 +8,69 @@ This is **operational history**, not a release log. For new features and
 ADR/HLD amendments, see the HLD files in `docs/hld/` and the task docs
 in `docs/tasks/`.
 
+## 2026-07-04 — Phase D: trash retention + multi-worker + production hardening (HLD-001 §5 / §13.2 / §15 / §16)
+
+> **Status: STUB** — placeholder added at TASK-D draft time (2026-07-04);
+> populated at merge time. The stub exists so the structure of the entry
+> is locked in early and reviewers can sanity-check it against the task
+> doc before any commits land on `main`. The per-change rows below list
+> the surfaces the entry will cover; concrete file/line references and
+> evidence (test counts, gate results) get filled in at merge.
+
+### D1 — Trash retention automation (HLD §13.2 new)
+
+| Change                                                                                                                              | Surface              | Rationale                                                                                                            |
+|-------------------------------------------------------------------------------------------------------------------------------------|----------------------|----------------------------------------------------------------------------------------------------------------------|
+| New `src/local_transcription_service/retention.py` — `RetentionPolicy` (pure) + `run_cleanup` (I/O) + `CleanupReport` (dataclass).  | Module               | Single point of truth for the retention policy; pure policy function is unit-testable without a tmpdir.              |
+| New `lts-trash-cleanup` console-script + `python -m local_transcription_service.retention` CLI. Exit codes 0/1/2 per TASK-D §3.3.   | CLI                  | Operable by the launchd plist (`-m`) and by hand (`lts-trash-cleanup`).                                             |
+| New env vars `LTS_TRASH_TTL_DAYS` (default 7) and `LTS_TRASH_MAX_BYTES` (default 512 MiB). Read by the CLI at start; no live re-config. | Config               | Two-knob policy: age cap + size cap. Both default-on; both tunable.                                                  |
+| New `scripts/launchd/com.local-transcription-service.trash-cleanup.plist` — `StartCalendarInterval Hour=4 Minute=0`, `RunAtLoad=false`. | Ops                  | Daily tick at 04:00 local. Deleted files are already in `trash/` (post-ack) — no live-pipeline interaction.          |
+| New `tests/test_retention.py` — 7 cases (TTL-only, size-only, combined, empty, dry-run, symlink, CLI subprocess).                    | Tests                | Pin the policy in isolation (pure function) and end-to-end (subprocess).                                             |
+| HLD §13.2 new subsection documents the policy, CLI contract, launchd wiring, filesystem invariants.                                | HLD                  | Single source of truth for the operator-facing contract.                                                             |
+
+### D2 — Multi-worker (HLD §5 amended)
+
+| Change                                                                                                                              | Surface              | Rationale                                                                                                            |
+|-------------------------------------------------------------------------------------------------------------------------------------|----------------------|----------------------------------------------------------------------------------------------------------------------|
+| New env var `LTS_WORKER_COUNT` (default `1`, range `1..64`) on `Settings`.                                                          | Config               | Exposes the lease-based claim protocol's multi-worker capability (architecturally supported since Phase A).            |
+| `Worker.__init__` accepts `worker_count`; `Worker.run_forever()` spawns N claim tasks cooperatively. Reclaim loop stays single.       | Module               | In-process multi-worker. No bind-port coordination; no cross-process log interleaving. SQLite write-lock is the ceiling. |
+| `app.main()` passes `settings.worker_count` into `Worker(...)`. `config_resolved` log event surfaces `worker_count`.                | Module / Logging     | One-line observability for the deployment shape.                                                                    |
+| New `PRAGMA busy_timeout = 5000` on every store connection.                                                                          | Module               | Defensive tuning so `/ready` waits on the SQLite write lock instead of failing fast.                                 |
+| `scripts/launchd/com.local-transcription-service.plist` adds `LTS_WORKER_COUNT=1` (explicit default). README env table adds a row.   | Ops                  | Operators see the knob in the plist and README; default matches the existing single-worker behaviour.                 |
+| `tests/test_worker.py` + `tests/test_store.py` + `tests/test_config.py` — +6 net cases (concurrent jobs, concurrent claim, lease-token respect, concurrent reclaim, range validation, default). | Tests                | Pin the race-free claim property of the SQL and the new config contract.                                            |
+| HLD §5 amended to "one FastAPI process; N concurrent claim loops inside it" + new §5.1–§5.4 (why in-process, race-condition audit, busy_timeout, what is unchanged). | HLD                  | Boundary test: 1 → N workers is operational, not architectural. ADR-012 stays unchanged.                            |
+
+### D3 — Production hardening (HLD §15 / §16 amended)
+
+| Change                                                                                                                              | Surface              | Rationale                                                                                                            |
+|-------------------------------------------------------------------------------------------------------------------------------------|----------------------|----------------------------------------------------------------------------------------------------------------------|
+| New `scripts/launchd/local-transcription-service.conf` — `newsyslog` config: `count=5`, `size=10M`, `when=$D0`, `flags=JN`. Operator installs via `sudo cp ... /etc/newsyslog.d/`. | Ops                  | Built-in macOS rotation. Keeps the log file bounded without the service rotating its own stdout.                    |
+| Runbook updated with the newsyslog install step.                                                                                    | Docs                 | Operator-facing install path; lives next to the existing plist install.                                              |
+| New `app.main()` startup probe: `asyncio.wait_for(engine.is_ready(), timeout=5.0)` → exit `78` (`EX_CONFIG`) if not ready / raises. | Module               | launchd does not auto-restart on `EX_CONFIG`. The service stays down rather than half-broken.                      |
+| New `src/local_transcription_service/metrics.py::ErrorRateCounter` — emits `error_rate_tick` every 60 s with per-code counts.       | Module               | Aggregate observability without a new endpoint; HLD §15 promise of "no metrics endpoint for MVP" is kept.            |
+| `tests/test_metrics.py` + `tests/test_app.py` — +5 net cases (counter emits counts, counter resets; exit-78 not-ready, exit-78 probe-raised, happy path). | Tests                | Pin the counter shape and the startup-exit contract.                                                                |
+| HLD §15 amended (worker_count in `config_resolved`, §15.1 error-rate counter, §15.2 what we are NOT doing). HLD §16 amended (§16.1 healthcheck-on-start, §16.2 log rotation, §16.3 trash cleanup plist). | HLD                  | All three items are operational; HLD is the right home.                                                             |
+
+### Phase D net delta (target, reconfirmed at merge time)
+
+- New files: `retention.py`, `metrics.py`, `test_retention.py`,
+  `test_metrics.py`, `trash-cleanup launchd plist`,
+  `newsyslog` config.
+- Modified: `config.py` (one field), `worker.py` (constructor +
+  run_forever), `app.py` (startup probe), `store.py` (busy_timeout),
+  `scripts/launchd/com.local-transcription-service.plist`,
+  `README.md` (env table + status section), runbook
+  (newsyslog install step), `pyproject.toml` (one console-script).
+- New tests: **+18 net** (target; actual reconfirmed at merge).
+  Phase C baseline 184 → Phase D target 202.
+- No new dependency; no `requirements.txt`; ADR-012 unchanged.
+
+### Verification at merge time (filled in post-merge)
+
+- `uv run pytest -q` — TBD (target: 202 passed).
+- `uv run ruff check .` — clean.
+- No cloud SDKs touched; no auth scheme change; no new endpoint.
+
 ## 2026-07-04 — Phase C: ack endpoint + retention (HLD-001 §13.1)
 
 Implementing the resolved Open Decision O-4 from HLD-001 §17.

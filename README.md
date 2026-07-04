@@ -133,7 +133,7 @@ curl http://192.168.0.99:8766/jobs/$JOB_ID -H "X-Auth-Token: $LTS_AUTH_TOKEN"
   `docs/changelogs/CHANGELOG.md` (2026-07-04 entry).
 - 153 tests passing (Phase B baseline), `ruff check` clean.
 
-**Phase C in flight** (HLD-001 §13.1 — closes O-4):
+**Phase C complete** (HLD-001 §13.1 — closes O-4):
 
 - ✅ `POST /jobs/{job_id}/ack` — idempotent, sets `acked_at`, moves the transcript
   from `results/` to `trash/`. FS move is re-attempted on each call when the file
@@ -143,12 +143,22 @@ curl http://192.168.0.99:8766/jobs/$JOB_ID -H "X-Auth-Token: $LTS_AUTH_TOKEN"
 - ✅ `GET /jobs/{id}` now exposes `acked_at` so the extension can confirm download
   acknowledgement from a poll cycle alone. Pinned by
   `test_get_job_after_ack_includes_acked_at_and_new_path`.
-- 184 tests passing (Phase B 153 + Phase C net +31, per user-side pytest run
-  2026-07-04). `ruff check` clean.
+- 184 tests passing (Phase B 153 + Phase C net +31, per pytest run 2026-07-04).
+  `ruff check` clean.
   See `docs/changelogs/CHANGELOG.md` (2026-07-04 Phase C entry) for the
   per-surface breakdown.
-- ⏳ `medium` vs `large-v3-turbo` benchmark (`scripts/whisper-macmini/bench-whisper.sh`)
-  — optional, kept open from Phase B.
+- See `docs/tasks/TASK-C-ack-and-retention.md` for the task spec + acceptance
+  criteria; status flipped to **DONE** at HEAD `150c43d`.
+
+### Open follow-ups (not blocking MVP)
+
+- `medium` vs `large-v3-turbo` benchmark (`scripts/whisper-macmini/bench-whisper.sh`)
+  — optional, kept open from Phase B (HLD §4 — `medium` is also downloaded; swap
+  is a config/wrapper change).
+- Manual smoke on a Mac Mini-reachable host (real gateway
+  `192.168.0.99:4000`) — extension-side verification only; not blocking service
+  merge. The Phase B opt-in integration test (`@pytest.mark.integration`) is the
+  future gate for this.
 
 **STT engine** (HLD §4 amended 2026-07-03): whisper.cpp (Metal) on the Mac
 Mini, fronted by the existing LiteLLM Proxy (`:4000`) via OpenAI

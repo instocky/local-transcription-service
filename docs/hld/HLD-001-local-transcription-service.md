@@ -111,21 +111,75 @@ as a third value without changing the worker or Stage 1/2.
 
 ## 5. Service topology
 
-**Single FastAPI process, single async worker.**  **[DECISION]**
+**One FastAPI process; N concurrent claim loops inside it.**  **[DECISION — amended 2026-07-04, Phase D]**
 
-The pipeline runs as an asyncio background task inside the same
-process as the HTTP server. ADR-012 explicitly excludes "Multiple
-concurrent processing workers" from scope, so adding workers is a
-future HLD concern, not an architecture change.
+The pipeline runs as asyncio background tasks inside the same
+process as the HTTP server. The number of claim loops is set
+by `LTS_WORKER_COUNT` (default `1`, range `1..64`). The reclaim
+loop stays single — it is already idempotent and cheap, and
+running it N times would be pure overhead.
 
-The service is structured so that adding workers later is a
-configuration change, not a redesign:
+> **Amendment note (Phase D).** The Phase A text said "single
+> async worker" and treated additional workers as a future HLD
+> concern. The lease protocol was designed for it from day one
+> (Phase A commit `53b2b89`), but no configuration knob exposed
+> it. Phase D adds `LTS_WORKER_COUNT` and runs N claim tasks
+> cooperatively in the same event loop. Multi-process deployment
+> (multiple `local-transcription-service` processes competing
+> for the same SQLite) is still a future deployment-shape
+> change, not a code change — `Worker` is already
+> process-agnostic.
+
+### 5.1 Why in-process, not multi-process
+
+- **No bind-port coordination.** One HTTP port, one HTTP server,
+  one FastAPI app. Multi-process would force port shifting or a
+  worker-only process shape (no HTTP listener), and would need
+  some out-of-band way to say "stop claiming".
+- **No cross-process log interleaving.** Each claim task gets a
+  stable `worker_id` (`f"w{i}"`) in structured log events; one
+  process means one stdout stream ordered by event time.
+- **SQLite's write-lock is the throughput ceiling.** One process
+  with 4 tasks has the same ceiling as 4 processes. Going
+  in-process saves the IPC overhead and gives us the
+  throughput-oracle for free.
+- **If in-process workers prove insufficient**, multi-process is
+  a deployment-shape change — the code is ready.
+
+### 5.2 Race-condition audit
+
+All races the codebase has are already safe under `LTS_WORKER_COUNT > 1`:
+
+| Race                                                                | Safe? | Why                                                                                                              |
+|---------------------------------------------------------------------|-------|-----------------------------------------------------------------------------------------------------------------|
+| Two claim tasks race for the same QUEUED job                        | YES   | `store.claim()` is one atomic UPDATE; the WHERE clause filters by `status='queued'` so only one task matches.   |
+| Two reclaim tasks race for the same expired lease                   | YES   | `reclaim_expired()` is one atomic UPDATE; `lease_expires_at < ?` filters the set per call.                     |
+| Two claim tasks race `store.mark_processing` for the same job      | YES   | `WHERE status='claimed' AND lease_token=:token` — only the task that holds the lease token matches.            |
+| Two claim tasks race `store.mark_done` for the same job            | YES   | Same lease-token filter.                                                                                         |
+| Two `mark_acked` calls from two extension clients on the same DONE | YES   | `WHERE status='done' AND acked_at IS NULL` — one UPDATE wins; the loser returns `rowcount=0` + `already_acked=true`. |
+| Two `update_transcript_path` calls racing for the same job         | YES   | The column is overwritten unconditionally and is idempotent for the same value.                                  |
+| Two processes start simultaneously, both call `store.init()`       | YES   | `init()` opens a connection, runs `CREATE TABLE IF NOT EXISTS`, then `PRAGMA table_info(jobs)` + idempotent `ALTER TABLE ADD COLUMN`. Each `ALTER` is a no-op once the column exists. The connection-per-op pattern means no shared in-memory state to race. |
+| Two processes both run `store.ping_writable()` from `/ready`       | YES (sequential) | `BEGIN IMMEDIATE` acquires the SQLite write lock; the second caller waits, then succeeds. SQLite's busy_timeout (5 s, see §5.3) caps the wait. |
+
+### 5.3 SQLite busy_timeout
+
+`PRAGMA busy_timeout = 5000` is set on every connection the
+store opens. This is a defensive tuning, not a correctness fix
+— SQLite's default behaviour on a busy lock is to fail fast,
+which is fine for the claim path (the claim loop retries on the
+next tick) but wrong for the readiness probe (we want to wait,
+not fail). 5 s is generous for a LAN tool and well below any
+interactive-recovery budget.
+
+### 5.4 What is unchanged from Phase A
 
 - The job store (Section 7) supports atomic claim with a lease.
 - The HTTP layer is stateless except for the job store.
-- A second process can be launched against the same SQLite file
-  without code changes — both will compete for jobs via the lease
-  protocol.
+- A second process *can* still be launched against the same
+  SQLite file without code changes — both will compete for jobs
+  via the lease protocol. The HLD does not enable that mode by
+  default, but the code is ready for it if a future deployment
+  needs it.
 
 ## 6. API contract (MVP target)
 
@@ -539,7 +593,89 @@ the contract idempotent even when the FS move is flaky — the
 DB never goes back to "not acked" after a successful ack, and the
 FS move eventually converges across retries.
 
-Retention policy: **see Open Decision O-4.**
+Retention policy: **see §13.2 (Phase D, 2026-07-04) — replaces the
+manual cleanup wording in O-4.**
+
+### 13.2 Trash retention automation (Phase D, 2026-07-04)
+
+Phase C (§13.1) made `trash/` the resting place for acked
+transcripts but left its growth unbounded. Phase D adds a
+deterministic retention policy shipped as a standalone CLI
+(`lts-trash-cleanup`) and a separate launchd plist that fires
+it daily.
+
+#### Policy knobs
+
+| Knob           | Env var                  | Default          | Semantics                                                                |
+|----------------|--------------------------|------------------|--------------------------------------------------------------------------|
+| Age cap (TTL)  | `LTS_TRASH_TTL_DAYS`     | `7`              | Files in `trash/` with `mtime < now() - TTL` are deleted (oldest first). |
+| Size cap       | `LTS_TRASH_MAX_BYTES`    | `536870912` (512 MiB) | If the cumulative size of `trash/` exceeds the cap, delete the oldest files (by `mtime`) until under cap. |
+
+A single invocation runs the two passes **in order: TTL first,
+then size cap**. Each pass is independent and idempotent —
+running the CLI twice in a row is a no-op the second time.
+
+#### CLI contract
+
+Console-script: `lts-trash-cleanup`. Also invokable as
+`python -m local_transcription_service.retention` (the form
+launchd uses).
+
+Flags:
+
+- `--dry-run` — log the deletion plan, exit 0, no `unlink()`.
+- `--data-dir PATH` — override `${LTS_DATA_DIR}` for one-off
+  runs.
+
+Exit codes:
+
+| Code | Meaning                                                                                                              |
+|------|----------------------------------------------------------------------------------------------------------------------|
+| 0    | Success (zero or more files deleted; cleanup converged).                                                            |
+| 1    | Configuration error (env var parse failed, `trash_dir` missing or not a directory).                                  |
+| 2    | Runtime I/O error (permission denied, fs went read-only mid-run). Best-effort cleanup; the next launchd tick handles the rest. |
+
+#### launchd wiring
+
+New plist at
+`scripts/launchd/com.local-transcription-service.trash-cleanup.plist`:
+
+- Label: `com.local-transcription-service.trash-cleanup`.
+- `StartCalendarInterval`: `Hour=4, Minute=0` — once a day at
+  04:00 local. Low-traffic window; deleted files are already in
+  `trash/` (post-ack), so there is no live-pipeline interaction.
+- `RunAtLoad`: `false` — no point running at boot; we want the
+  daily tick.
+- `StandardOutPath` / `StandardErrorPath`:
+  `~/Library/Logs/local-transcription-service.trash-cleanup.log`.
+- `EnvironmentVariables`: copies only the retention knobs
+  (`LTS_DATA_DIR`, `LTS_TRASH_TTL_DAYS`, `LTS_TRASH_MAX_BYTES`).
+  No `LTS_AUTH_TOKEN` — the CLI doesn't need it.
+
+#### Why a CLI, not an in-process background task
+
+1. Once we run N claim loops (Phase D §5), an in-process
+   cleanup loop would run N times per interval — each loop
+   walking `trash/` independently. A single CLI scheduled by
+   launchd runs once across the whole system.
+2. The CLI is testable end-to-end with a tmpdir + a few fake
+   transcript files; an in-process task would need lifecycle
+   plumbing (start/stop, joined with shutdown).
+3. The launchd-driven approach gives the operator a free
+   override: temporarily running `lts-trash-cleanup --dry-run`
+   to inspect the deletion plan is a single command, no service
+   restart.
+
+#### Filesystem invariants
+
+- `trash/` is allowed to be empty after a cleanup pass.
+- `trash/` is **not** deleted by the CLI. Operators who want to
+  wipe everything do it manually with `rm -rf` (and accept that
+  the next transcript that lands there re-creates the directory).
+- Symlinks in `trash/` are never followed. The CLI uses
+  `Path.unlink(missing_ok=True)`; an operator who drops a link
+  there gets the same crash-resistant behaviour as for a real
+  file.
 
 ## 14. Network binding and auth
 
@@ -590,11 +726,39 @@ At service startup, log the resolved configuration (token value is
  "stt_engine": "openai", "stt_model": "whisper-large-v3-turbo",
  "bind_host": "192.168.0.99", "bind_port": 8766,
  "data_dir": "/Users/me/.local-transcription",
- "lease_ttl_s": 600, "max_attempts": 2}
+ "lease_ttl_s": 600, "max_attempts": 2,
+ "worker_count": 4}
 ```
 
+`worker_count` (added Phase D) appears in `config_resolved` so
+operators can confirm the multi-worker deployment shape from a
+single log line.
+
 `launchd` captures stdout/stderr to a file under
-`~/Library/Logs/local-transcription-service.log`.
+`~/Library/Logs/local-transcription-service.log`. **Rotation** is
+handled by macOS `newsyslog` (see §16.4); the service does not
+rotate its own log.
+
+### 15.1 Error-rate counter (Phase D, 2026-07-04)
+
+A small in-process counter emits an `error_rate_tick` event every
+60 seconds with per-code counts since the last tick:
+
+```json
+{"ts": "...", "level": "INFO", "event": "error_rate_tick",
+ "interval_s": 60,
+ "counts": {"FETCH_FAILED": 3, "STT_GATEWAY_UNAVAILABLE": 1, "MAX_ATTEMPTS": 0}}
+```
+
+Why not Prometheus / OpenMetrics: HLD-001 says "no metrics
+endpoint for MVP". A log-emitted counter keeps that promise and is
+enough for a single-user tool — the operator's existing
+log-tailing workflow gets a richer feed without a new endpoint to
+monitor. If a future phase adds Prometheus, this counter is the
+right place to extend (the metric names line up with the log
+event names).
+
+### 15.2 What we are NOT doing
 
 No distributed tracing, no metrics endpoint for MVP — keeps with
 ADR-012's "low operational complexity" driver. If a future HLD adds
@@ -625,6 +789,78 @@ The plist:
 
 For Linux/Jetson (future target), the equivalent would be a systemd
 unit — same operational pattern, different syntax.
+
+### 16.1 Healthcheck-on-start (Phase D, 2026-07-04)
+
+Before starting uvicorn, `app.main()` calls
+`asyncio.wait_for(engine.is_ready(), timeout=5.0)`. If the
+engine is not ready (returns `False` or raises), the service:
+
+1. Logs a `startup_stt_not_ready` event with the underlying error
+   in the JSON log feed.
+2. Calls `sys.exit(78)` (sysexits.h `EX_CONFIG`).
+
+`launchd` does not auto-restart on `EX_CONFIG` (`KeepAlive.Crashed`
+only triggers on signal-style exits). The operator sees the log
+line and the service stays down until they intervene — exactly
+what we want, because silently starting a half-broken service is
+worse than no service.
+
+The 5-second budget matches the short-timeout path inside
+`LiteLLMWhisperSTT.is_ready()` (Phase B drift fix, commit
+`22d7f04`).
+
+### 16.2 Log rotation (Phase D, 2026-07-04)
+
+macOS `newsyslog` rotates the launchd-captured stdout/stderr
+files. The config lives at
+`scripts/launchd/local-transcription-service.conf`:
+
+```text
+# logfilename                                              mode  count  size  when  flags
+/Users/__USER__/Library/Logs/local-transcription-service.log              644  5     10M   $D0   JN
+/Users/__USER__/Library/Logs/local-transcription-service.trash-cleanup.log  644  5     10M   $D0   JN
+```
+
+- `count=5` — keep 5 rotated files (so 50 MB total ceiling).
+- `size=10M` — rotate when the current file crosses 10 MB.
+- `when=$D0` — rotate at midnight on any day it crosses the size threshold.
+- `flags=JN` — bzip2 the rotated files (`J`), create with the right
+  mode if missing (`N`).
+
+Install step (operator runs once):
+
+```bash
+sudo cp scripts/launchd/local-transcription-service.conf /etc/newsyslog.d/
+```
+
+Documented in the existing runbook
+(`docs/runbooks/whisper-macmini-provisioning.md`).
+
+For Linux/Jetson (future target), the equivalent is a
+`/etc/logrotate.d/local-transcription-service` snippet with the
+same shape; not implemented now.
+
+### 16.3 Trash cleanup plist (Phase D, 2026-07-04)
+
+A second plist at
+`scripts/launchd/com.local-transcription-service.trash-cleanup.plist`
+fires the `lts-trash-cleanup` CLI daily at 04:00 local. See §13.2
+for the CLI contract and §16 above for the general plist shape;
+this one differs by:
+
+- `StartCalendarInterval` (`Hour=4, Minute=0`) instead of
+  `RunAtLoad`.
+- `RunAtLoad=false`.
+- `EnvironmentVariables` carries only retention knobs — no
+  `LTS_AUTH_TOKEN`, no `LTS_BIND_HOST`, no `LTS_STT_*`.
+
+Install alongside the main plist:
+
+```bash
+cp scripts/launchd/com.local-transcription-service.trash-cleanup.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.local-transcription-service.trash-cleanup.plist
+```
 
 ## 17. Resolved decisions
 
