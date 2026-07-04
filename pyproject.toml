@@ -28,6 +28,7 @@ dev = [
 
 [project.scripts]
 local-transcription-service = "local_transcription_service.app:main"
+lts-trash-cleanup = "local_transcription_service.retention:main"
 
 [build-system]
 requires = ["hatchling"]

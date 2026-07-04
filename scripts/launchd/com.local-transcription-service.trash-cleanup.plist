@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local-transcription-service.trash-cleanup</string>
+
+    <!-- Run as the logged-in user. -->
+    <key>UserName</key>
+    <string>__REPLACE_WITH_USERNAME__</string>
+
+    <!--
+        Service program. Adjust paths after `uv sync`. We invoke the
+        module (not the console-script) so the launchd plist does not
+        depend on the bin/ entry-point layout — the Python in the venv
+        finds the module via its sys.path.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPLACE_WITH_REPO_ROOT__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>local_transcription_service.retention</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPLACE_WITH_REPO_ROOT__</string>
+
+    <!--
+        launchd does not source ~/.local-transcription/env implicitly.
+        The CLI needs only the retention knobs; no auth token, no STT
+        keys (the CLI never touches the network).
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>LTS_DATA_DIR</key>
+        <string>__REPLACE_WITH_DATA_DIR__</string>
+        <key>LTS_TRASH_TTL_DAYS</key>
+        <string>7</string>
+        <key>LTS_TRASH_MAX_BYTES</key>
+        <string>536870912</string>
+    </dict>
+
+    <!--
+        Daily tick at 04:00 local. Low-traffic window; deleted files
+        are already in trash/ (post-ack), so there is no live-pipeline
+        interaction. Do NOT set RunAtLoad: launching at boot is wasted
+        work — we want the daily tick on the schedule, not at login.
+    -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- stdout/stderr captured by launchd. Inspect with:
+         tail -f ~/Library/Logs/local-transcription-service.trash-cleanup.log -->
+    <key>StandardOutPath</key>
+    <string>__REPLACE_WITH_LOG_PATH__</string>
+    <key>StandardErrorPath</key>
+    <string>__REPLACE_WITH_LOG_PATH__</string>
+</dict>
+</plist>
