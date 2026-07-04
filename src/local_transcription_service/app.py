@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from typing import TYPE_CHECKING
 
 import uvicorn
@@ -21,6 +22,7 @@ from local_transcription_service import __version__
 from local_transcription_service.api import health, jobs
 from local_transcription_service.config import Settings, get_settings
 from local_transcription_service.logging import configure_logging
+from local_transcription_service.metrics import ErrorRateCounter
 from local_transcription_service.pipeline.whisper_pipeline import WhisperPipeline
 from local_transcription_service.queue.store import JobStore
 from local_transcription_service.stt.base import STTEngine
@@ -111,8 +113,9 @@ def _log_config_resolved(settings: Settings) -> None:
 
     Fields mirror the HLD example: ``stt_engine``, ``stt_model``,
     ``bind_host``, ``bind_port``, ``data_dir``, ``lease_ttl_s``,
-    ``max_attempts``. The auth token is **never** logged — it is a
-    secret and would also be a footgun in any aggregated log feed.
+    ``max_attempts``, ``worker_count``. The auth token is **never**
+    logged — it is a secret and would also be a footgun in any
+    aggregated log feed.
     """
     logger.info(
         "config resolved",
@@ -125,6 +128,7 @@ def _log_config_resolved(settings: Settings) -> None:
             "data_dir": str(settings.data_dir),
             "lease_ttl_s": settings.lease_ttl_seconds,
             "max_attempts": settings.max_attempts,
+            "worker_count": settings.worker_count,
         },
     )
 
@@ -133,9 +137,10 @@ def main() -> None:
     """Console entry point for `local-transcription-service`.
 
     Wires the production STT engine + pipeline, configures JSON
-    logging, then starts the HTTP server and the background worker
-    in the same event loop. Uvicorn handles SIGINT/SIGTERM; on
-    graceful exit the worker is stopped and awaited.
+    logging, runs the STT-readiness startup probe (HLD-001 §16.1),
+    then starts the HTTP server and the background worker in the
+    same event loop. Uvicorn handles SIGINT/SIGTERM; on graceful
+    exit the worker is stopped and awaited.
     """
     settings = get_settings()
     settings.ensure_dirs()
@@ -146,28 +151,92 @@ def main() -> None:
     engine = build_stt_engine(settings)
     pipeline = build_pipeline(settings, engine)
 
-    async def _run() -> None:
-        store = JobStore(settings.db_path)
-        await store.init()
-        app = create_app(settings=settings, store=store, pipeline=pipeline)
-        worker = Worker(store, pipeline, settings)
+    asyncio.run(_run(settings, engine, pipeline))
 
-        config = uvicorn.Config(
-            app,
-            host=settings.bind_host,
-            port=settings.bind_port,
-            log_level="info",
+
+async def _startup_probe(engine: STTEngine) -> bool:
+    """Run the HLD-001 §16.1 STT-readiness probe.
+
+    Returns ``True`` if the engine reports ``is_ready() == True``
+    within the 5-second budget. Returns ``False`` and emits a
+    ``startup_stt_not_ready`` log line on:
+
+    - ``is_ready()`` returns ``False``
+    - ``is_ready()`` raises any exception (network error, auth
+      failure, timeout, etc.)
+    - the 5-second ``wait_for`` times out
+
+    The probe is intentionally broad in its exception handling:
+    any failure means "not ready", and the caller maps that to
+    ``sys.exit(78)``. The log line carries the underlying exception
+    for operator triage.
+
+    The 5-second budget matches the short-timeout path inside
+    ``LiteLLMWhisperSTT.is_ready()`` (Phase B drift fix, commit
+    ``22d7f04``).
+    """
+    try:
+        ready = await asyncio.wait_for(engine.is_ready(), timeout=5.0)
+    except (TimeoutError, Exception) as exc:  # noqa: BLE001
+        logger.error(
+            "startup aborted: STT readiness probe failed: %s",
+            exc,
+            extra={"event": "startup_stt_not_ready"},
         )
-        server = uvicorn.Server(config)
+        return False
+    if not ready:
+        logger.error(
+            "startup aborted: STT engine not ready",
+            extra={"event": "startup_stt_not_ready"},
+        )
+        return False
+    return True
 
-        worker_task = asyncio.create_task(worker.run_forever(), name="lts-worker")
-        try:
-            await server.serve()
-        finally:
-            worker.stop()
-            await worker_task
 
-    asyncio.run(_run())
+async def _run(
+    settings: Settings,
+    engine: STTEngine,
+    pipeline: TranscriptionPipeline,
+) -> None:
+    """Inner async entry — startup probe, then HTTP + worker.
+
+    The probe MUST run before the DB is opened or uvicorn starts:
+    if the STT gateway is not reachable (common during boot when
+    launchd fires before networking settles), the service exits
+    ``78`` (``EX_CONFIG``) and launchd's ``KeepAlive.Crashed`` does
+    NOT restart it. The operator sees a ``startup_stt_not_ready``
+    log line and intervenes — better than starting a half-broken
+    service that fails every job with ``STT_GATEWAY_UNAVAILABLE``.
+    """
+    if not await _startup_probe(engine):
+        sys.exit(78)
+
+    store = JobStore(settings.db_path)
+    await store.init()
+    app = create_app(settings=settings, store=store, pipeline=pipeline)
+    error_rate_counter = ErrorRateCounter()
+    worker = Worker(
+        store,
+        pipeline,
+        settings,
+        worker_count=settings.worker_count,
+        error_rate_counter=error_rate_counter,
+    )
+
+    config = uvicorn.Config(
+        app,
+        host=settings.bind_host,
+        port=settings.bind_port,
+        log_level="info",
+    )
+    server = uvicorn.Server(config)
+
+    worker_task = asyncio.create_task(worker.run_forever(), name="lts-worker")
+    try:
+        await server.serve()
+    finally:
+        worker.stop()
+        await worker_task
 
 
 if __name__ == "__main__":

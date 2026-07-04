@@ -18,6 +18,9 @@ current DI shape"). These tests pin the contract:
 The health-check side of the wiring (delegating to
 ``STTEngine.is_ready()``) is covered by ``test_health.py`` /
 ``test_health_ready.py``.
+
+Phase D adds tests for ``_startup_probe`` (HLD-001 §16.1):
+not-ready → ``False``, raised → ``False``, ready → ``True``.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from __future__ import annotations
 import pytest
 
 from local_transcription_service.app import (
+    _startup_probe,
     build_pipeline,
     build_stt_engine,
     create_app,
@@ -204,3 +208,60 @@ def test_build_pipeline_uses_settings_audio_cache_dir(tmp_path) -> None:
     pipeline = build_pipeline(settings, engine)
 
     assert pipeline._audio_cache_dir == settings.audio_cache_dir  # noqa: SLF001
+
+
+# ---------- _startup_probe (HLD-001 §16.1, Phase D) ----------
+
+
+class _StubEngine:
+    """Async stub for STTEngine protocol — only ``is_ready`` is exercised."""
+
+    def __init__(self, *, ready: bool = True, raises: Exception | None = None) -> None:
+        self._ready = ready
+        self._raises = raises
+
+    async def is_ready(self) -> bool:
+        if self._raises is not None:
+            raise self._raises
+        return self._ready
+
+    async def transcribe(self, *_args: object, **_kwargs: object) -> str:  # pragma: no cover
+        return "stub"
+
+
+async def test_startup_probe_returns_true_when_ready() -> None:
+    """Happy path — engine reports is_ready() == True → probe passes."""
+    engine = _StubEngine(ready=True)
+    assert await _startup_probe(engine) is True  # type: ignore[arg-type]
+
+
+async def test_startup_probe_returns_false_when_not_ready(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """is_ready() == False → probe returns False AND logs startup_stt_not_ready."""
+    engine = _StubEngine(ready=False)
+    import logging
+
+    with caplog.at_level(logging.ERROR, logger="local_transcription_service.app"):
+        result = await _startup_probe(engine)  # type: ignore[arg-type]
+
+    assert result is False
+    found = [r for r in caplog.records if getattr(r, "event", None) == "startup_stt_not_ready"]
+    assert found, "startup_stt_not_ready event missing from logs"
+
+
+async def test_startup_probe_returns_false_when_probe_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Any exception in is_ready() → probe returns False AND logs the failure."""
+    engine = _StubEngine(raises=ConnectionError("gateway unreachable"))
+    import logging
+
+    with caplog.at_level(logging.ERROR, logger="local_transcription_service.app"):
+        result = await _startup_probe(engine)  # type: ignore[arg-type]
+
+    assert result is False
+    found = [r for r in caplog.records if getattr(r, "event", None) == "startup_stt_not_ready"]
+    assert found
+    # The log line should carry the underlying exception for operator triage.
+    assert "gateway unreachable" in found[0].getMessage()
