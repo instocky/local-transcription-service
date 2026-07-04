@@ -178,8 +178,7 @@ curl http://192.168.0.99:8766/jobs/$JOB_ID -H "X-Auth-Token: $LTS_AUTH_TOKEN"
   - `scripts/launchd/local-transcription-service.conf` — `newsyslog`
     config rotates both log files at 10 MiB / day, keep 5
     generations, bzip2'd (HLD §16.2).
-- 210 tests passing (Phase C 184 + Phase D net +26 retention + 6 new
-  metric/worker/config), `ruff check` clean.
+- 232 tests passing (Phase C 184 + Phase D net +48 retention / metrics / worker / config / app), `ruff check` clean.
 - See `docs/tasks/TASK-D-trash-retention-multi-worker-hardening.md`
   for the task spec + acceptance criteria.
 

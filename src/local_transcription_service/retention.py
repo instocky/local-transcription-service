@@ -165,13 +165,25 @@ class RetentionPolicy:
 class CleanupReport:
     """Result of one retention pass.
 
-    ``deleted`` and ``kept`` count files (not bytes). ``freed_bytes``
-    is the sum of ``size`` for the files actually unlinked — i.e. the
-    bytes reclaimed by this run. ``dry_run`` mirrors the input flag so
-    the report can be inspected after the fact.
+    ``deleted`` counts files THIS run actually unlinked from disk.
+    ``already_gone`` counts files in the selection set that were
+    gone by the time ``run_cleanup`` tried to remove them (operator
+    action between the dir walk and the unlink loop, or a
+    concurrent cleanup process). ``kept`` is the count of files
+    we walked over but did NOT select for deletion — i.e. recent
+    files under both knobs.
+
+    ``freed_bytes`` is the sum of ``size`` for files THIS run
+    actually unlinked. A file that was already gone contributes
+    zero bytes even though it was in the selection set; this is
+    intentional — the report reflects *what we did*, not *what we
+    would have done if the operator hadn't beaten us to it*.
+
+    The total walked is ``deleted + already_gone + kept``.
     """
 
     deleted: int
+    already_gone: int
     kept: int
     freed_bytes: int
     dry_run: bool
@@ -225,7 +237,13 @@ async def run_cleanup(
             extra={"event": "retention_trash_dir_created", "path": str(trash_dir)},
         )
         await asyncio.to_thread(trash_dir.mkdir, parents=True, exist_ok=True)
-        return CleanupReport(deleted=0, kept=0, freed_bytes=0, dry_run=dry_run)
+        return CleanupReport(
+            deleted=0,
+            already_gone=0,
+            kept=0,
+            freed_bytes=0,
+            dry_run=dry_run,
+        )
 
     if not await asyncio.to_thread(trash_dir.is_dir):
         msg = f"trash_dir exists but is not a directory: {trash_dir}"
@@ -278,6 +296,7 @@ async def run_cleanup(
     selection_paths = {e.path for e in selection}
 
     deleted = 0
+    already_gone = 0
     freed_bytes = 0
 
     if dry_run:
@@ -299,6 +318,7 @@ async def run_cleanup(
         )
         return CleanupReport(
             deleted=0,
+            already_gone=0,
             kept=len(entries),
             freed_bytes=0,
             dry_run=True,
@@ -308,12 +328,28 @@ async def run_cleanup(
         if entry.path not in selection_paths:
             continue
         try:
-            # missing_ok=True: handles the "operator deleted the file
-            # between iterdir and unlink" race. The race only loses
-            # one unlink; the count is still right.
-            await asyncio.to_thread(entry.path.unlink, missing_ok=True)
-            deleted += 1
-            freed_bytes += entry.size
+            # No `missing_ok=True` — we want the FileNotFoundError to
+            # propagate so we can distinguish "we unlinked it" from
+            # "it was already gone" for accounting purposes (P1 from
+            # the Phase D review). The previous shape with
+            # missing_ok=True unconditionally counted the file as
+            # deleted even when the unlink was a no-op, which made
+            # `deleted` and `freed_bytes` lie on the file-race path.
+            await asyncio.to_thread(entry.path.unlink)
+        except FileNotFoundError:
+            # Operator or concurrent cleanup beat us to it. Don't
+            # count this as a deletion (we did not actually delete
+            # anything), but log it so the operator can see the
+            # race in the JSON feed. The selection WAS right — the
+            # file just isn't here anymore.
+            already_gone += 1
+            log.info(
+                "retention: file already gone before unlink",
+                extra={
+                    "event": "retention_already_gone",
+                    "path": str(entry.path),
+                },
+            )
         except OSError as exc:
             log.warning(
                 "retention: unlink failed",
@@ -323,13 +359,17 @@ async def run_cleanup(
                     "error": str(exc),
                 },
             )
+        else:
+            deleted += 1
+            freed_bytes += entry.size
 
-    kept = len(entries) - deleted
+    kept = len(entries) - deleted - already_gone
     log.info(
         "retention: complete",
         extra={
             "event": "retention_complete",
             "deleted": deleted,
+            "already_gone": already_gone,
             "kept": kept,
             "freed_bytes": freed_bytes,
             "dry_run": False,
@@ -339,7 +379,13 @@ async def run_cleanup(
             },
         },
     )
-    return CleanupReport(deleted=deleted, kept=kept, freed_bytes=freed_bytes, dry_run=False)
+    return CleanupReport(
+        deleted=deleted,
+        already_gone=already_gone,
+        kept=kept,
+        freed_bytes=freed_bytes,
+        dry_run=False,
+    )
 
 
 # ---------- CLI ----------
@@ -487,8 +533,8 @@ async def amain(argv: list[str] | None = None) -> int:
     # the CLI by hand see the counts. The structured log line above
     # already has the same numbers for log-feed consumers.
     sys.stdout.write(
-        f"retention: deleted={report.deleted} kept={report.kept} "
-        f"freed_bytes={report.freed_bytes} dry_run={report.dry_run}\n"
+        f"retention: deleted={report.deleted} already_gone={report.already_gone} "
+        f"kept={report.kept} freed_bytes={report.freed_bytes} dry_run={report.dry_run}\n"
     )
     sys.stdout.flush()
     return 0

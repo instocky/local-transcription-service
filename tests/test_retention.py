@@ -238,9 +238,109 @@ async def test_run_cleanup_dry_run_does_not_unlink(tmp_path: Path) -> None:
 
     assert report.deleted == 0
     assert report.kept == 1
+    assert report.already_gone == 0
     assert report.dry_run is True
     assert report.freed_bytes == 0
     assert old.exists() is True, "dry-run must not unlink"
+
+
+async def test_run_cleanup_accounts_for_already_gone_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1 from the Phase D review: if a file disappears between the
+    dir walk and the unlink loop, we must report it as
+    ``already_gone=1``, NOT as ``deleted=1``.
+
+    The fix is to call ``unlink()`` WITHOUT ``missing_ok=True`` so
+    ``FileNotFoundError`` propagates and we can count the race
+    separately. Without this, ``deleted`` and ``freed_bytes`` lie
+    on every concurrent-cleanup or operator-beats-us case.
+    """
+    trash_dir = tmp_path / "trash"
+    trash_dir.mkdir()
+    now = 1_000_000.0
+    old = trash_dir / "old.md"
+    old.write_text("hello", encoding="utf-8")
+    os.utime(old, (now - 30 * 86_400, now - 30 * 86_400))
+
+    policy = RetentionPolicy(ttl_days=7, max_bytes=10**9)
+
+    # Simulate the race: the operator deletes the file (or a
+    # concurrent cleanup does) AFTER the dir walk. We do this by
+    # patching Path.unlink to raise FileNotFoundError on the first
+    # call — equivalent to the operator deleting the file between
+    # iterdir and our unlink.
+    import pathlib
+
+    real_unlink = pathlib.Path.unlink
+
+    def _unlink_race(self: pathlib.Path, *args: object, **kwargs: object) -> None:
+        # The file gets "deleted" by the operator just before
+        # our unlink — mirror that by raising FileNotFoundError
+        # unless missing_ok was explicitly asked for.
+        if not kwargs.get("missing_ok", False):
+            raise FileNotFoundError(self)
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", _unlink_race)
+
+    report = await run_cleanup(trash_dir=trash_dir, policy=policy, now=now)
+
+    # Critical assertions — the lie we are guarding against:
+    assert report.deleted == 0, (
+        "deleted must NOT count files we didn't actually unlink"
+    )
+    assert report.freed_bytes == 0, (
+        "freed_bytes must NOT count bytes we didn't actually reclaim"
+    )
+    assert report.already_gone == 1, (
+        "the file was selected but already gone — count it in already_gone"
+    )
+    assert report.kept == 0
+
+
+async def test_run_cleanup_accounts_already_gone_alongside_real_deletions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed path: one file actually deleted, one file vanished
+    between walk and unlink. Both buckets are reported correctly
+    and ``freed_bytes`` reflects ONLY the real deletion.
+    """
+    trash_dir = tmp_path / "trash"
+    trash_dir.mkdir()
+    now = 1_000_000.0
+
+    real = trash_dir / "real.md"
+    ghost = trash_dir / "ghost.md"
+    real.write_text("a" * 100, encoding="utf-8")  # 100 bytes
+    ghost.write_text("b" * 50, encoding="utf-8")  # 50 bytes
+    os.utime(real, (now - 30 * 86_400, now - 30 * 86_400))
+    os.utime(ghost, (now - 30 * 86_400, now - 30 * 86_400))
+
+    policy = RetentionPolicy(ttl_days=7, max_bytes=10**9)
+
+    # Race only on `ghost.md` — operator deletes it before our unlink.
+    import pathlib
+
+    real_unlink = pathlib.Path.unlink
+
+    def _unlink_selective(self: pathlib.Path, *args: object, **kwargs: object) -> None:
+        if self.name == "ghost.md":
+            raise FileNotFoundError(self)
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", _unlink_selective)
+
+    report = await run_cleanup(trash_dir=trash_dir, policy=policy, now=now)
+
+    assert report.deleted == 1
+    assert report.already_gone == 1
+    assert report.freed_bytes == 100, (
+        "freed_bytes must reflect ONLY the file we actually unlinked"
+    )
+    assert report.kept == 0
 
 
 async def test_run_cleanup_empty_trash_dir(tmp_path: Path) -> None:
@@ -465,7 +565,9 @@ def test_cli_subprocess_dry_run_does_not_delete(tmp_path: Path) -> None:
 
 def test_cleanup_report_is_frozen() -> None:
     """CleanupReport is a frozen dataclass — assignment raises FrozenInstanceError."""
-    report = CleanupReport(deleted=0, kept=0, freed_bytes=0, dry_run=False)
+    report = CleanupReport(
+        deleted=0, already_gone=0, kept=0, freed_bytes=0, dry_run=False,
+    )
     with pytest.raises(dataclasses.FrozenInstanceError):  # type: ignore[attr-defined]
         report.deleted = 1  # type: ignore[misc]
 

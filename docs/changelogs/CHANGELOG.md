@@ -76,6 +76,14 @@ in `docs/tasks/`.
 - `uv run pytest -q` — **230 passed, 1 skipped** in 15.28s (Windows fs symlink skip).
   Phase C baseline 184 → Phase D 230, +46 net.
 - `uv run ruff check .` — clean (all checks passed).
+- **Post-merge review bump (2026-07-04):** the Tech Lead P1 review added
+  2 race-accounting tests for `retention.run_cleanup` —
+  `test_run_cleanup_accounts_for_already_gone_files` and
+  `test_run_cleanup_accounts_already_gone_alongside_real_deletions`.
+  Current HEAD reports **232 passed, 1 skipped** (Phase D net +48);
+  the +2 delta is the P1 review fix on `main`, not a new phase.
+  The numbers above (230 / +46) are the **at-merge snapshot**; the
+  README Status section carries the current-HEAD number (232 / +48).
 - **Drift check vs HLD-001 amendments (manual grep):**
   - `git grep -nE "single async worker"` over `src/` returns nothing. ✅
   - `git grep -nE "Manual cleanup of .trash"` over `docs/` returns nothing. ✅
