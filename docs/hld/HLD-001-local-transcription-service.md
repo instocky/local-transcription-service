@@ -200,7 +200,7 @@ Response (200 OK):
 ```json
 {
   "job_id": "9f3c1b7e-...-...",
-  "status": "queued | claimed | processing | done | error | failed",
+  "status": "queued | claimed | processing | done | failed",
   "attempt": 0,
   "created_at": "2026-07-03T14:30:00Z",
   "started_at": null,
@@ -223,7 +223,7 @@ When `status == "done"`:
 }
 ```
 
-When `status == "error"` or `"failed"`:
+When `status == "failed"`:
 
 ```json
 {
@@ -263,7 +263,7 @@ Database path: `${LTS_DATA_DIR}/jobs.db`, default
 CREATE TABLE jobs (
     job_id        TEXT PRIMARY KEY,
     video_url     TEXT NOT NULL,
-    status        TEXT NOT NULL,        -- queued|claimed|processing|done|error|failed
+    status        TEXT NOT NULL,        -- queued|claimed|processing|done|failed
     attempt       INTEGER NOT NULL DEFAULT 0,
     lease_token   TEXT,                 -- NULL when not claimed
     lease_expires_at TEXT,              -- ISO 8601 UTC
@@ -295,8 +295,8 @@ WHERE job_id = :job_id
   AND status = 'queued';
 ```
 
-A background task scans every `LTS_RECLAIM_INTERVAL` seconds (default
-30s) for jobs in `claimed` or `processing` status whose
+A background task scans every `LTS_RECLAIM_INTERVAL_SECONDS` seconds
+(default 30s) for jobs in `claimed` or `processing` status whose
 `lease_expires_at` has passed. Such jobs are returned to `queued`
 with `attempt` already incremented.
 
@@ -331,11 +331,20 @@ without false reclaims.
 └──────┘            └──────┘
 ```
 
-`error` is reserved for transient failures during processing where a
-retry is sensible (e.g., transient network blip during media
-download). `failed` is the terminal state after retry exhaustion.
-The extension treats both as terminal non-success but logs them
-differently.
+`failed` is the only terminal non-success state. Transient (retryable)
+failures are deferred back to `queued` with `next_retry_at` set
+(see §10); the worker reschedules them after the backoff and the
+job re-enters `claimed`. A job only reaches `failed` when:
+
+- the failure is non-retryable (e.g., invalid URL, model not
+  registered), OR
+- the retryable failure has exhausted `LTS_MAX_ATTEMPTS`.
+
+The `error` payload attached to a `failed` job is a structured
+`JobError { code, message, retryable }` (see `models.JobError`),
+not a job status. The extension renders both `failed` jobs and
+"max-attempts-deferred-then-failed" jobs the same way; the
+`error.code` lets the user tell the difference.
 
 ## 10. Retry policy
 
@@ -347,14 +356,26 @@ transient failures (network blip during media fetch, brief ffmpeg
 hiccup, transient STT-gateway unavailability) without papering over
 genuine problems.
 
-Retryable errors (per ADR-012 contract):
+### Tunables (env-var contract)
+
+| Env var                       | Default | Meaning                                                                 |
+| ----------------------------- | ------- | ----------------------------------------------------------------------- |
+| `LTS_MAX_ATTEMPTS`            | `2`     | Max processing attempts per job (initial + retries).                    |
+| `LTS_RETRY_BACKOFF_SECONDS`   | `30`    | Delay between retry attempts; applied as `next_retry_at = now + N s`.   |
+| `LTS_LEASE_TTL_SECONDS`       | `600`   | Worker lease before reclaim (see §8).                                    |
+| `LTS_RECLAIM_INTERVAL_SECONDS`| `30`    | Background scan cadence for expired leases (see §8).                    |
+
+### Retry semantics
+
+Retryable errors (per ADR-012 contract) — deferred back to `queued`
+with `next_retry_at` until `LTS_MAX_ATTEMPTS` is reached:
 
 - Media fetch transient failure (network).
 - ffmpeg transient failure.
 - STT engine transient unavailability (e.g., whisper-server / LiteLLM restart).
 - STT inference OOM-recoverable (e.g., after releasing other memory).
 
-Non-retryable errors:
+Non-retryable errors — marked `failed` immediately on first attempt:
 
 - Invalid URL.
 - Video unavailable / private / region-locked.
@@ -362,7 +383,8 @@ Non-retryable errors:
 - Missing STT model (not registered in LiteLLM).
 - Malformed request.
 
-Backoff between attempt 1 and attempt 2: **30 seconds.**
+Backoff between attempt 1 and attempt 2: `LTS_RETRY_BACKOFF_SECONDS`
+seconds (default **30 seconds**).
 
 ## 11. Pipeline stages (operational)
 
@@ -401,18 +423,19 @@ current Mac Mini (≥8 GB unified memory).
 
 | Failure                          | Detection                        | Recovery                                                              |
 |----------------------------------|----------------------------------|-----------------------------------------------------------------------|
-| Service crash mid-job            | Lease expires                    | Background reclaim returns job to `queued`.                          |
-| `ffmpeg` missing                 | Subprocess exits non-zero        | Non-retryable `error` with `code=AUDIO_CONDITIONING_FAILED`; surfaced via API. |
-| `ffmpeg` non-zero exit           | Subprocess exits non-zero        | Non-retryable `error` with `code=AUDIO_CONDITIONING_FAILED`; surfaced via API. |
-| `yt-dlp` missing                 | Subprocess exits non-zero        | Non-retryable `error` with `code=FETCH_FAILED`, surfaced via API.   |
-| `yt-dlp` non-zero exit           | Subprocess exits non-zero        | Non-retryable `error` with `code=FETCH_FAILED`, surfaced via API.   |
-| Network drop during fetch        | `yt-dlp` exits with network error on stderr | Retryable `error` with `code=FETCH_FAILED`; backoff 30s.    |
-| STT gateway down                 | `POST /v1/audio/transcriptions` (or preflight `GET /v1/models`) connection refused, timeout, or 5xx | Retryable `error` with `code=STT_GATEWAY_UNAVAILABLE`; reclaim returns job to `queued` after 30s backoff. |
-| STT model not registered         | `GET /v1/models` does not list model | Non-retryable `error` with `code=MODEL_NOT_PULLED`; operator registers the whisper deployment in LiteLLM and resubmits. |
-| STT request rejected (4xx)       | `POST /v1/audio/transcriptions` returns a 4xx other than model-not-registered, or a malformed/non-JSON body | Non-retryable `error` with `code=STT_BAD_REQUEST`; malformed request — fix and resubmit. |
-| whisper.cpp model file missing   | `whisper-server` fails to start / 5xx | launchd surfaces via `whisper-server.err`; jobs retryable until the service is healthy. |
-| Disk full                        | Write raises `OSError`           | Non-retryable `error`; user frees space and resubmits.                |
-| OOM during inference             | Process killed / Python raises   | Retryable; reclaim returns job to `queued`.                            |
+| Service crash mid-job            | Lease expires                    | Background reclaim returns job to `queued` (attempt unchanged).       |
+| `ffmpeg` missing                 | Subprocess `FileNotFoundError`   | Marked `failed` with `JobError(code="AUDIO_CONDITIONING_FAILED", retryable=False)`. |
+| `ffmpeg` non-zero exit           | Subprocess exits non-zero        | Marked `failed` with `JobError(code="AUDIO_CONDITIONING_FAILED", retryable=False)`. |
+| `yt-dlp` missing                 | Subprocess `FileNotFoundError`   | Marked `failed` with `JobError(code="FETCH_FAILED", retryable=False)`. |
+| `yt-dlp` non-zero exit (config)  | Subprocess exits non-zero, no network marker | Marked `failed` with `JobError(code="FETCH_FAILED", retryable=False)` (e.g. video unavailable / private). |
+| Network drop during fetch        | `yt-dlp` exits with transient network marker on stderr | Deferred to `queued` with `next_retry_at = now + LTS_RETRY_BACKOFF_SECONDS`; `JobError(code="FETCH_FAILED", retryable=True)`. |
+| `yt-dlp` SSL/cert error          | `yt-dlp` exits with `ssl: certificate verify failed` on stderr | Marked `failed` with `JobError(code="FETCH_FAILED", retryable=False)` — operator must fix cert/CA bundle; retries do not help. |
+| STT gateway down                 | `POST /v1/audio/transcriptions` (or preflight `GET /v1/models`) connection refused, timeout, or 5xx | Deferred to `queued` with `JobError(code="STT_GATEWAY_UNAVAILABLE", retryable=True)`; retried after `LTS_RETRY_BACKOFF_SECONDS`. |
+| STT model not registered         | `GET /v1/models` does not list model | Marked `failed` with `JobError(code="MODEL_NOT_PULLED", retryable=False)`; operator registers the whisper deployment in LiteLLM and resubmits. |
+| STT request rejected (4xx)       | `POST /v1/audio/transcriptions` returns a 4xx other than model-not-registered, or a malformed/non-JSON body | Marked `failed` with `JobError(code="STT_BAD_REQUEST", retryable=False)`; malformed request — fix and resubmit. |
+| whisper.cpp model file missing   | `whisper-server` fails to start / 5xx | launchd surfaces via `whisper-server.err`; jobs deferred as `STT_GATEWAY_UNAVAILABLE` until the service is healthy. |
+| Disk full                        | Write raises `OSError`           | Marked `failed` with `JobError(code="PIPELINE_TRANSIENT", retryable=True)`; user frees space and resubmits (worker fallback path). |
+| OOM during inference             | Process killed / Python raises   | Deferred to `queued` (transient); reclaim returns job to `queued` after the lease TTL. |
 | Wrong / missing X-Auth-Token     | API request missing header       | `401 Unauthorized`. No job state change.                              |
 
 ## 13. Result storage
