@@ -10,66 +10,91 @@ in `docs/tasks/`.
 
 ## 2026-07-04 — Phase D: trash retention + multi-worker + production hardening (HLD-001 §5 / §13.2 / §15 / §16)
 
-> **Status: STUB** — placeholder added at TASK-D draft time (2026-07-04);
-> populated at merge time. The stub exists so the structure of the entry
-> is locked in early and reviewers can sanity-check it against the task
-> doc before any commits land on `main`. The per-change rows below list
-> the surfaces the entry will cover; concrete file/line references and
-> evidence (test counts, gate results) get filled in at merge.
-
 ### D1 — Trash retention automation (HLD §13.2 new)
 
 | Change                                                                                                                              | Surface              | Rationale                                                                                                            |
 |-------------------------------------------------------------------------------------------------------------------------------------|----------------------|----------------------------------------------------------------------------------------------------------------------|
-| New `src/local_transcription_service/retention.py` — `RetentionPolicy` (pure) + `run_cleanup` (I/O) + `CleanupReport` (dataclass).  | Module               | Single point of truth for the retention policy; pure policy function is unit-testable without a tmpdir.              |
+| New `src/local_transcription_service/retention.py` (498 lines) — `RetentionPolicy` (pure) + `TrashEntry` + `CleanupReport` (frozen dataclasses) + `select_for_deletion` (pure, two-pass TTL→size) + `run_cleanup` (I/O, dry-run aware) + `main` / `amain` CLI entry. | Module               | Single point of truth for the retention policy; pure policy function is unit-testable without a tmpdir.              |
 | New `lts-trash-cleanup` console-script + `python -m local_transcription_service.retention` CLI. Exit codes 0/1/2 per TASK-D §3.3.   | CLI                  | Operable by the launchd plist (`-m`) and by hand (`lts-trash-cleanup`).                                             |
 | New env vars `LTS_TRASH_TTL_DAYS` (default 7) and `LTS_TRASH_MAX_BYTES` (default 512 MiB). Read by the CLI at start; no live re-config. | Config               | Two-knob policy: age cap + size cap. Both default-on; both tunable.                                                  |
-| New `scripts/launchd/com.local-transcription-service.trash-cleanup.plist` — `StartCalendarInterval Hour=4 Minute=0`, `RunAtLoad=false`. | Ops                  | Daily tick at 04:00 local. Deleted files are already in `trash/` (post-ack) — no live-pipeline interaction.          |
-| New `tests/test_retention.py` — 7 cases (TTL-only, size-only, combined, empty, dry-run, symlink, CLI subprocess).                    | Tests                | Pin the policy in isolation (pure function) and end-to-end (subprocess).                                             |
-| HLD §13.2 new subsection documents the policy, CLI contract, launchd wiring, filesystem invariants.                                | HLD                  | Single source of truth for the operator-facing contract.                                                             |
+| New `scripts/launchd/com.local-transcription-service.trash-cleanup.plist` — `StartCalendarInterval Hour=4 Minute=0`, `RunAtLoad=false`, env vars retention-only. | Ops                  | Daily tick at 04:00 local. Deleted files are already in `trash/` (post-ack) — no live-pipeline interaction.          |
+| `pyproject.toml` — registered `lts-trash-cleanup` console-script under `[project.scripts]`.                                         | Build                | Idempotent `uv sync` exposes the CLI on `$PATH`.                                                                    |
+| New `tests/test_retention.py` — 27 cases: 9 pure-function (TTL / size / combined / empty / zero-TTL / zero-max / range validation / dataclass frozen invariants / counter f-string formatting) + 9 I/O tests (happy / keep-recent / dry-run / empty / missing-dir / symlink-not-follow / subdir-skip / not-a-dir / subprocess) + 9 CLI tests. | Tests                | Pin the policy in isolation (pure function) and end-to-end (subprocess).                                             |
+| New `docs/runbooks/lts-operations.md` — operator runbook for the trash-cleanup install + log rotation + worker-count + probe verification + rollback. | Docs                 | Single operator-facing doc for Phase D ops; ASCII-only heredoc-friendly.                                              |
+| HLD §13.2 new subsection (78 lines) documents the policy, CLI contract, launchd wiring, filesystem invariants.                       | HLD                  | Single source of truth for the operator-facing contract.                                                             |
 
 ### D2 — Multi-worker (HLD §5 amended)
 
 | Change                                                                                                                              | Surface              | Rationale                                                                                                            |
 |-------------------------------------------------------------------------------------------------------------------------------------|----------------------|----------------------------------------------------------------------------------------------------------------------|
-| New env var `LTS_WORKER_COUNT` (default `1`, range `1..64`) on `Settings`.                                                          | Config               | Exposes the lease-based claim protocol's multi-worker capability (architecturally supported since Phase A).            |
-| `Worker.__init__` accepts `worker_count`; `Worker.run_forever()` spawns N claim tasks cooperatively. Reclaim loop stays single.       | Module               | In-process multi-worker. No bind-port coordination; no cross-process log interleaving. SQLite write-lock is the ceiling. |
-| `app.main()` passes `settings.worker_count` into `Worker(...)`. `config_resolved` log event surfaces `worker_count`.                | Module / Logging     | One-line observability for the deployment shape.                                                                    |
-| New `PRAGMA busy_timeout = 5000` on every store connection.                                                                          | Module               | Defensive tuning so `/ready` waits on the SQLite write lock instead of failing fast.                                 |
-| `scripts/launchd/com.local-transcription-service.plist` adds `LTS_WORKER_COUNT=1` (explicit default). README env table adds a row.   | Ops                  | Operators see the knob in the plist and README; default matches the existing single-worker behaviour.                 |
-| `tests/test_worker.py` + `tests/test_store.py` + `tests/test_config.py` — +6 net cases (concurrent jobs, concurrent claim, lease-token respect, concurrent reclaim, range validation, default). | Tests                | Pin the race-free claim property of the SQL and the new config contract.                                            |
-| HLD §5 amended to "one FastAPI process; N concurrent claim loops inside it" + new §5.1–§5.4 (why in-process, race-condition audit, busy_timeout, what is unchanged). | HLD                  | Boundary test: 1 → N workers is operational, not architectural. ADR-012 stays unchanged.                            |
+| New env var `LTS_WORKER_COUNT` (default `1`, range `1..64`) on `Settings` (`Field(ge=1, le=64)`).                                  | Config               | Exposes the lease-based claim protocol's multi-worker capability (architecturally supported since Phase A).            |
+| `Worker.__init__` accepts `worker_count` (default 1) and `error_rate_counter` (default None); `Worker.run_forever()` spawns N claim tasks cooperatively in the same event loop. Reclaim loop stays single. Each claim task tagged `worker_id=f"w{i}"` in structured logs. | Module               | In-process multi-worker. No bind-port coordination; no cross-process log interleaving. SQLite write-lock is the ceiling. |
+| `app.main()` passes `settings.worker_count` into `Worker(...)` and constructs an `ErrorRateCounter`. `_log_config_resolved()` surfaces `worker_count` in the startup event. | Module / Logging     | One-line observability for the deployment shape.                                                                    |
+| `JobStore._connect()` async-context-manager helper — every `aiosqlite.connect(self._db_path)` in the module now sets `PRAGMA busy_timeout = 5000` immediately after open. All 14 connection sites refactored. | Module               | Defensive tuning so `/ready` waits on the SQLite write lock instead of failing fast.                                 |
+| `scripts/launchd/com.local-transcription-service.plist` adds `LTS_WORKER_COUNT=1` (explicit default). README env table adds a row pointing to §5. | Ops                  | Operators see the knob in the plist and README; default matches the existing single-worker behaviour.                 |
+| `tests/test_worker.py` — +3 cases (`test_run_forever_with_worker_count_4_processes_concurrent_jobs`, `test_concurrent_claim_only_one_worker_wins_per_job`, `test_concurrent_mark_processing_respects_lease`). | Tests                | Pin the race-free claim property of the SQL with deterministic drain.                                               |
+| `tests/test_store.py` — +2 cases (`test_concurrent_reclaim_is_safe`, `test_busy_timeout_set_on_every_connection`).               | Tests                | Pin the atomic reclaim and the per-connection pragma.                                                                |
+| `tests/test_config.py` — +5 cases (default, env-var pick-up, zero-rejected, too-large-rejected, non-integer-rejected).            | Tests                | Pin the `Field(ge=1, le=64)` contract.                                                                                |
+| HLD §5 amended to "one FastAPI process; N concurrent claim loops inside it" + new §5.1–§5.4 (why in-process, race-condition audit table, busy_timeout, what is unchanged). | HLD                  | Boundary test: 1 → N workers is operational, not architectural. ADR-012 stays unchanged.                            |
 
 ### D3 — Production hardening (HLD §15 / §16 amended)
 
 | Change                                                                                                                              | Surface              | Rationale                                                                                                            |
 |-------------------------------------------------------------------------------------------------------------------------------------|----------------------|----------------------------------------------------------------------------------------------------------------------|
-| New `scripts/launchd/local-transcription-service.conf` — `newsyslog` config: `count=5`, `size=10M`, `when=$D0`, `flags=JN`. Operator installs via `sudo cp ... /etc/newsyslog.d/`. | Ops                  | Built-in macOS rotation. Keeps the log file bounded without the service rotating its own stdout.                    |
-| Runbook updated with the newsyslog install step.                                                                                    | Docs                 | Operator-facing install path; lives next to the existing plist install.                                              |
-| New `app.main()` startup probe: `asyncio.wait_for(engine.is_ready(), timeout=5.0)` → exit `78` (`EX_CONFIG`) if not ready / raises. | Module               | launchd does not auto-restart on `EX_CONFIG`. The service stays down rather than half-broken.                      |
-| New `src/local_transcription_service/metrics.py::ErrorRateCounter` — emits `error_rate_tick` every 60 s with per-code counts.       | Module               | Aggregate observability without a new endpoint; HLD §15 promise of "no metrics endpoint for MVP" is kept.            |
-| `tests/test_metrics.py` + `tests/test_app.py` — +5 net cases (counter emits counts, counter resets; exit-78 not-ready, exit-78 probe-raised, happy path). | Tests                | Pin the counter shape and the startup-exit contract.                                                                |
+| New `scripts/launchd/local-transcription-service.conf` — `newsyslog` config: `count=5`, `size=10M`, `when=$D0`, `flags=JN` for both `local-transcription-service.log` and `local-transcription-service.trash-cleanup.log`. Operator installs via `sudo cp ... /etc/newsyslog.d/`. | Ops                  | Built-in macOS rotation. Keeps the log file bounded without the service rotating its own stdout.                    |
+| `docs/runbooks/lts-operations.md` updated with the newsyslog install step (`sudo cp ... ; sudo newsyslog -v`) and rollback.        | Docs                 | Operator-facing install path; lives next to the existing plist install.                                              |
+| New `app.main()` startup probe: `app._startup_probe(engine)` calls `asyncio.wait_for(engine.is_ready(), timeout=5.0)`; failure or False → `_run` exits `78` (`EX_CONFIG`) so launchd does not auto-restart. | Module               | launchd does not auto-restart on `EX_CONFIG`. The service stays down rather than half-broken.                      |
+| New `src/local_transcription_service/metrics.py` — `ErrorRateCounter` (dict + asyncio.Lock) + `run_error_rate_loop` background task that emits `error_rate_tick` every 60 s with per-code counts. `Worker._handle_pipeline_failure` increments on the terminal-FAIL path only (NOT on retry defer). | Module               | Aggregate observability without a new endpoint; HLD §15 promise of "no metrics endpoint for MVP" is kept.            |
+| `tests/test_metrics.py` — 7 cases (per-code counts, tick returns + resets, reset clears, fresh-dict semantics, empty-after-init, log-line emission, stop-event short-circuit). | Tests                | Pin the counter shape and the tick loop's lifecycle.                                                                 |
+| `tests/test_app.py` — +3 cases (`test_startup_probe_returns_true_when_ready`, `test_startup_probe_returns_false_when_not_ready`, `test_startup_probe_returns_false_when_probe_raises`). | Tests                | Pin the probe contract: ready → True, not-ready → False + log, raises → False + log.                                |
 | HLD §15 amended (worker_count in `config_resolved`, §15.1 error-rate counter, §15.2 what we are NOT doing). HLD §16 amended (§16.1 healthcheck-on-start, §16.2 log rotation, §16.3 trash cleanup plist). | HLD                  | All three items are operational; HLD is the right home.                                                             |
 
-### Phase D net delta (target, reconfirmed at merge time)
+### Phase D net delta (reconfirmed)
 
-- New files: `retention.py`, `metrics.py`, `test_retention.py`,
-  `test_metrics.py`, `trash-cleanup launchd plist`,
-  `newsyslog` config.
-- Modified: `config.py` (one field), `worker.py` (constructor +
-  run_forever), `app.py` (startup probe), `store.py` (busy_timeout),
-  `scripts/launchd/com.local-transcription-service.plist`,
-  `README.md` (env table + status section), runbook
-  (newsyslog install step), `pyproject.toml` (one console-script).
-- New tests: **+18 net** (target; actual reconfirmed at merge).
-  Phase C baseline 184 → Phase D target 202.
-- No new dependency; no `requirements.txt`; ADR-012 unchanged.
+- **New files (7):** `src/local_transcription_service/retention.py`,
+  `src/local_transcription_service/metrics.py`,
+  `tests/test_retention.py`, `tests/test_metrics.py`,
+  `scripts/launchd/com.local-transcription-service.trash-cleanup.plist`,
+  `scripts/launchd/local-transcription-service.conf`,
+  `docs/runbooks/lts-operations.md`.
+- **Modified (5):** `src/local_transcription_service/config.py` (1 field),
+  `src/local_transcription_service/queue/store.py` (1 helper + 14 call-site refactors),
+  `src/local_transcription_service/worker.py` (constructor + run_forever + worker_id threading + counter),
+  `src/local_transcription_service/app.py` (startup probe + counter wiring),
+  `scripts/launchd/com.local-transcription-service.plist` (LTS_WORKER_COUNT=1),
+  `pyproject.toml` (1 console-script),
+  `README.md` (env table + Status section),
+  `docs/hld/HLD-001-local-transcription-service.md` (§5, §13.2, §15, §16 amendments).
+- **New tests: +46 net** — Phase C baseline 184 → **Phase D 230**. Breakdown:
+  `test_retention.py` +27, `test_metrics.py` +7, `test_worker.py` +3,
+  `test_store.py` +2, `test_config.py` +5, `test_app.py` +3 — exceeds
+  the TASK-D §8 target of +18 net; every additional case is meaningful.
+- **No new dependency; no `requirements.txt`; ADR-012 unchanged.**
 
-### Verification at merge time (filled in post-merge)
+### Verification at merge time
 
-- `uv run pytest -q` — TBD (target: 202 passed).
-- `uv run ruff check .` — clean.
-- No cloud SDKs touched; no auth scheme change; no new endpoint.
+- `uv run pytest -q` — **230 passed, 1 skipped** in 15.28s (Windows fs symlink skip).
+  Phase C baseline 184 → Phase D 230, +46 net.
+- `uv run ruff check .` — clean (all checks passed).
+- **Drift check vs HLD-001 amendments (manual grep):**
+  - `git grep -nE "single async worker"` over `src/` returns nothing. ✅
+  - `git grep -nE "Manual cleanup of .trash"` over `docs/` returns nothing. ✅
+  - `git grep -n "sys.exit(78)"` over `src/` returns 1 hit in `app.py`. ✅
+  - `git grep -n "lts-trash-cleanup"` over `pyproject.toml` returns 1 hit. ✅
+- **Secret scan:** `git grep -nE "sk-[a-z0-9]{20,}"` over tracked files — no hits. ✅
+- **`.mavis/plans/` not committed** (`git ls-files .mavis` returns empty). ✅
+- **Race-condition sanity:** `test_run_forever_with_worker_count_4_processes_concurrent_jobs`
+  runs 8 jobs through 4 cooperative claim tasks; all 8 reach DONE
+  with deterministic drain via the Phase B6 `done_event` pattern.
+  This is the in-test proxy for the d4 race-condition audit (TASK-D
+  §4.2): the audit table claims every existing UPDATE is already
+  safe under `LTS_WORKER_COUNT > 1`, and this test verifies it in
+  practice for the claim → mark_processing → mark_done path.
+- **Real-gateway smoke (192.168.0.99:4000)** — **SKIP**, same as Phase B/C:
+  the Windows runner cannot reach the Mac Mini. The Phase B opt-in
+  integration test (`@pytest.mark.integration`) is the future gate.
+- No cloud SDKs touched; no auth scheme change; no new endpoint;
+  no new dependency.
 
 ## 2026-07-04 — Phase C: ack endpoint + retention (HLD-001 §13.1)
 
