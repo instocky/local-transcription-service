@@ -1,6 +1,6 @@
 """End-to-end tests for the `/jobs/*` endpoints.
 
-Wire-contract assertions follow HLD-001 §9.2 (202 + poll_url on
+Wire-contract assertions follow HLD-001 §6 (202 + poll_url on
 submit; transcript + transcript_path on the state response for
 DONE jobs; YouTube-only URL validation per HLD-001 O-3).
 """
@@ -165,7 +165,7 @@ async def test_get_job_includes_transcript_and_path_when_done(
     store: JobStore,
     settings: Settings,
 ) -> None:
-    """HLD-001 §9.2: DONE state response must carry transcript + transcript_path."""
+    """HLD-001 §6: DONE state response must carry transcript + transcript_path."""
     created = await client.post(
         "/jobs",
         json={"video_url": "https://www.youtube.com/watch?v=done"},

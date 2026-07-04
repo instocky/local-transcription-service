@@ -3,7 +3,7 @@
 All routes in this router require a valid `X-Auth-Token` header —
 the dependency is applied at router level so individual route
 decorators stay clean. Status codes and response shapes follow
-HLD-001 §9.2.
+HLD-001 §6.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ async def submit_job(
 ) -> SubmitJobResponse:
     """Submit a video URL for transcription.
 
-    HLD-001 §9.2: returns 202 (not 201) and includes `poll_url` in
+    HLD-001 §6: returns 202 (not 201) and includes `poll_url` in
     the response body so clients can start polling without
     constructing the path themselves.
     """
@@ -78,7 +78,7 @@ async def get_job(job_id: str, request: Request) -> JobStateResponse:
     """Return current state of a job.
 
     For DONE jobs, the response also includes `transcript` (the
-    full text) and `transcript_path` (HLD-001 §9.2). The file is
+    full text) and `transcript_path` (HLD-001 §6). The file is
     read off the event loop via `asyncio.to_thread` so a slow
     disk doesn't block other requests.
     """

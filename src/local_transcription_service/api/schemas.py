@@ -5,7 +5,7 @@ types) so the wire contract stays decoupled from storage and
 pipeline code. Adding a field to the internal `Job` dataclass
 should NOT silently leak into the public API.
 
-Field shapes follow HLD-001 §9.2 (POST/GET `/jobs` responses).
+Field shapes follow HLD-001 §6 (POST/GET `/jobs` responses).
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ class SubmitJobRequest(BaseModel):
 
 
 class SubmitJobResponse(BaseModel):
-    """Response body for `POST /jobs` (HTTP 202 Accepted, HLD-001 §9.2).
+    """Response body for `POST /jobs` (HTTP 202 Accepted, HLD-001 §6).
 
     `poll_url` is a server-relative path the client can poll to read
     job state. We deliberately do NOT return a full URL — the
@@ -72,7 +72,7 @@ class SubmitJobResponse(BaseModel):
 
 
 class JobStateResponse(BaseModel):
-    """Response body for `GET /jobs/{id}` (HLD-001 §9.2).
+    """Response body for `GET /jobs/{id}` (HLD-001 §6).
 
     Field semantics:
     - `transcript`: full transcript text when `status == "done"`, else null.

@@ -59,7 +59,7 @@ uv run local-transcription-service
 The service starts both the HTTP server and the background worker in
 the same process.
 
-## API surface (current — HLD-001 §9.2)
+## API surface (current — HLD-001 §6)
 
 All routes below require the `X-Auth-Token` header (set in
 `LTS_AUTH_TOKEN`), except `/health` and `/ready` which are public
