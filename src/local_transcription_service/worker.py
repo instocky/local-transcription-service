@@ -141,7 +141,10 @@ class Worker:
             await self._handle_pipeline_failure(job, error)
             return True
 
-        transcript_path = self._settings.results_dir / f"{job.job_id}.txt"
+        # HLD-001 §11 / §13: results are written as `.md` (not `.txt`).
+        # The extension is the operator-facing contract; ``/jobs/{id}/result``
+        # streams the file with ``text/plain; charset=utf-8`` regardless.
+        transcript_path = self._settings.results_dir / f"{job.job_id}.md"
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
         transcript_path.write_text(text, encoding="utf-8")
 

@@ -175,7 +175,7 @@ async def test_get_job_includes_transcript_and_path_when_done(
     claimed = await store.claim(lease_ttl_seconds=60)
     assert claimed is not None
     await store.mark_processing(claimed.job_id, lease_token=claimed.lease_token)
-    transcript_path = settings.results_dir / f"{job_id}.txt"
+    transcript_path = settings.results_dir / f"{job_id}.md"
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
     transcript_path.write_text("hello world", encoding="utf-8")
     await store.mark_done(
@@ -232,7 +232,7 @@ async def test_get_result_returns_text_when_done(
     claimed = await store.claim(lease_ttl_seconds=60)
     assert claimed is not None
     await store.mark_processing(claimed.job_id, lease_token=claimed.lease_token)
-    transcript_path = settings.results_dir / f"{job_id}.txt"
+    transcript_path = settings.results_dir / f"{job_id}.md"
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
     transcript_path.write_text("hello world", encoding="utf-8")
     await store.mark_done(
@@ -286,7 +286,7 @@ async def test_get_result_500_when_done_but_file_missing(
     claimed = await store.claim(lease_ttl_seconds=60)
     assert claimed is not None
     await store.mark_processing(claimed.job_id, lease_token=claimed.lease_token)
-    ghost_path = settings.results_dir / f"{job_id}.txt"
+    ghost_path = settings.results_dir / f"{job_id}.md"
     await store.mark_done(
         claimed.job_id,
         lease_token=claimed.lease_token,
