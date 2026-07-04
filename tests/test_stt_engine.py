@@ -238,6 +238,130 @@ async def test_transcribe_preflight_gateway_down_is_retryable(
     assert exc_info.value.retryable is True
 
 
+# ---------- /models response shape validation (TL review P3) ----------
+
+
+async def test_transcribe_models_data_not_list_is_bad_request(
+    monkeypatch: pytest.MonkeyPatch, wav: Path
+) -> None:
+    """`{"data": "foo"}` -> STT_BAD_REQUEST (non-retryable).
+
+    Without strict validation the previous code iterated the string
+    and returned a list of single-character model ids; transcribe()
+    would then fail later in the upload with a confusing error.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"object": "list", "data": "foo"})
+
+    _install_transport(monkeypatch, handler)
+    with pytest.raises(PipelineError) as exc_info:
+        await _make_engine().transcribe(wav)
+
+    assert exc_info.value.code == "STT_BAD_REQUEST"
+    assert exc_info.value.retryable is False
+
+
+async def test_transcribe_models_data_contains_non_object_is_bad_request(
+    monkeypatch: pytest.MonkeyPatch, wav: Path
+) -> None:
+    """`{"data": ["foo"]}` -> STT_BAD_REQUEST (non-retryable).
+
+    Without strict validation the previous code did
+    `m.get("id", "")` on the string "foo" and raised AttributeError,
+    which fell through to the generic PIPELINE_TRANSIENT retryable
+    branch — the wrong code for a gateway contract violation.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"object": "list", "data": ["foo"]})
+
+    _install_transport(monkeypatch, handler)
+    with pytest.raises(PipelineError) as exc_info:
+        await _make_engine().transcribe(wav)
+
+    assert exc_info.value.code == "STT_BAD_REQUEST"
+    assert exc_info.value.retryable is False
+
+
+async def test_transcribe_models_entry_missing_string_id_is_bad_request(
+    monkeypatch: pytest.MonkeyPatch, wav: Path
+) -> None:
+    """`{"data": [{"object": "model"}]}` -> STT_BAD_REQUEST (non-retryable).
+
+    A gateway entry without a string ``id`` is a contract violation.
+    The previous code returned ``""`` (treating the absent id as a
+    real model named "") and silently marked is_ready as False even
+    when the configured model was present in a sibling entry.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"object": "list", "data": [{"object": "model"}, {"id": MODEL}]},
+        )
+
+    _install_transport(monkeypatch, handler)
+    with pytest.raises(PipelineError) as exc_info:
+        await _make_engine().transcribe(wav)
+
+    assert exc_info.value.code == "STT_BAD_REQUEST"
+    assert exc_info.value.retryable is False
+
+
+async def test_transcribe_models_response_not_object_is_bad_request(
+    monkeypatch: pytest.MonkeyPatch, wav: Path
+) -> None:
+    """A JSON array (no top-level object) -> STT_BAD_REQUEST."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"id": MODEL}])
+
+    _install_transport(monkeypatch, handler)
+    with pytest.raises(PipelineError) as exc_info:
+        await _make_engine().transcribe(wav)
+
+    assert exc_info.value.code == "STT_BAD_REQUEST"
+    assert exc_info.value.retryable is False
+
+
+# ---------- is_ready must not raise (TL review P3 second half) ----------
+
+
+async def test_is_ready_false_on_malformed_models_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """is_ready() must swallow STT_BAD_REQUEST from _list_models and
+    return False. The /ready probe must report not-ready, not 500.
+    """
+    _install_transport(
+        monkeypatch,
+        lambda req: httpx.Response(200, json={"data": ["foo"]}),
+    )
+    assert await _make_engine().is_ready() is False
+
+
+async def test_is_ready_false_on_unexpected_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """is_ready() must swallow ANY exception, not just PipelineError.
+
+    The STTEngine protocol says is_ready "must not raise — an
+    unreachable backend reports False, not an exception". The
+    previous code only caught PipelineError, so an unexpected
+    exception (e.g. a programming bug in _list_models, or a
+    non-PipelineError raised by an httpx mock) would escape and
+    turn /ready into a 500.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        msg = "boom"
+        raise RuntimeError(msg)
+
+    _install_transport(monkeypatch, handler)
+    assert await _make_engine().is_ready() is False
+
+
 # ---------- is_ready (HLD-001 §8) ----------
 
 

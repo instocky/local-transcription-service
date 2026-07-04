@@ -185,7 +185,54 @@ class LiteLLMWhisperSTT:
                 code="STT_BAD_REQUEST",
                 retryable=False,
             ) from exc
-        return [m.get("id", "") for m in payload.get("data", [])]
+
+        # The OpenAI /models contract is:
+        #   {"object": "list", "data": [{"id": "<model-id>", ...}, ...]}
+        # The previous code did `[m.get("id", "") for m in
+        # payload.get("data", [])]`, which silently misbehaves on
+        # any deviation:
+        #   - payload not a dict (e.g. JSON array) -> AttributeError
+        #     on .get()
+        #   - payload.data not a list (e.g. string, dict, None) ->
+        #     iteration yields chars/keys, list of "" or dict keys
+        #   - entry not a dict (e.g. {"data": ["foo"]}) ->
+        #     AttributeError on m.get()
+        # Any of these would let an AttributeError/TypeError escape
+        # _list_models: transcribe() falls into the
+        # PIPELINE_TRANSIENT (retryable) branch instead of the
+        # intended STT_BAD_REQUEST (non-retryable), and is_ready()
+        # returns False for the wrong reason. Strict validation
+        # surfaces gateway contract violations as STT_BAD_REQUEST.
+        if not isinstance(payload, dict):
+            raise PipelineError(
+                "STT gateway /models response is not a JSON object",
+                code="STT_BAD_REQUEST",
+                retryable=False,
+            )
+        data = payload.get("data")
+        if not isinstance(data, list):
+            raise PipelineError(
+                "STT gateway /models response.data is not a list",
+                code="STT_BAD_REQUEST",
+                retryable=False,
+            )
+        models: list[str] = []
+        for entry in data:
+            if not isinstance(entry, dict):
+                raise PipelineError(
+                    "STT gateway /models response contains a non-object entry",
+                    code="STT_BAD_REQUEST",
+                    retryable=False,
+                )
+            mid = entry.get("id")
+            if not isinstance(mid, str):
+                raise PipelineError(
+                    "STT gateway /models response entry is missing a string 'id'",
+                    code="STT_BAD_REQUEST",
+                    retryable=False,
+                )
+            models.append(mid)
+        return models
 
     @staticmethod
     def _gateway_unavailable(op: str, exc: Exception) -> PipelineError:
