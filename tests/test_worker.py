@@ -238,13 +238,28 @@ async def test_run_forever_processes_multiple_jobs(
     for i in range(3):
         await store.submit(f"https://www.youtube.com/watch?v=job{i}")
 
-    worker = Worker(store, MockPipeline(), settings)
+    done_count = 0
+    done_event = asyncio.Event()
 
-    async def _stop_after() -> None:
-        await asyncio.sleep(0.2)
+    def _on_done(job_id: str) -> None:
+        nonlocal done_count
+        done_count += 1
+        if done_count >= 3:
+            done_event.set()
+
+    worker = Worker(store, MockPipeline(), settings, on_done=_on_done)
+
+    async def _stop_after_done() -> None:
+        # Wait deterministically for the third mark_done callback
+        # instead of racing the wall clock — the previous shape
+        # (asyncio.sleep(0.2)) was a flake on Windows because
+        # SQLite write-lock contention can exceed 200 ms.
+        await asyncio.wait_for(done_event.wait(), timeout=5.0)
         worker.stop()
 
-    asyncio.create_task(_stop_after())
+    stop_task = asyncio.create_task(_stop_after_done())
     await asyncio.wait_for(worker.run_forever(), timeout=5.0)
+    await stop_task
 
+    assert done_count == 3
     assert await store.count_by_status(JobStatus.DONE) == 3

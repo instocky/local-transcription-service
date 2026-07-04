@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from local_transcription_service.config import Settings
@@ -52,11 +53,29 @@ class Worker:
         store: JobStore,
         pipeline: TranscriptionPipeline,
         settings: Settings,
+        *,
+        on_done: Callable[[str], None] | None = None,
     ) -> None:
+        """Construct the worker.
+
+        ``on_done`` is an OPTIONAL test-only signal hook invoked
+        synchronously after a job successfully transitions to
+        ``DONE`` (i.e. after ``store.mark_done`` returns truthy).
+        Production callers omit it; the hook is a no-op by default
+        and adds zero overhead to the hot path beyond a single
+        ``is None`` check.
+
+        The hook is fired with the just-completed ``job_id``. It is
+        intentionally a plain callable (not a coroutine) so the
+        worker can stay in the synchronous end-of-iteration code
+        path. If a test needs to fan out asynchronously, it can
+        schedule work from inside the callback.
+        """
         self._store = store
         self._pipeline = pipeline
         self._settings = settings
         self._stop = asyncio.Event()
+        self._on_done = on_done
 
     # ---------- lifecycle ----------
 
@@ -138,6 +157,8 @@ class Worker:
             )
         else:
             logger.info("job done", extra={"job_id": job.job_id})
+            if self._on_done is not None:
+                self._on_done(job.job_id)
         return True
 
     async def reclaim_once(self) -> int:
