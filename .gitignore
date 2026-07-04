@@ -44,3 +44,6 @@ docs/note_*.md
 
 # Mac Mini provisioning scripts (runbook is canonical; scripts not used)
 scripts/whisper-macmini/
+
+# Tooling-only (Mavis runtime, not part of shipped repo)
+.mavis/

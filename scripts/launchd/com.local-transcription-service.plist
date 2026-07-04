@@ -35,11 +35,13 @@
         <key>LTS_AUTH_TOKEN</key>
         <string>__REPLACE_WITH_AUTH_TOKEN__</string>
         <key>LTS_STT_ENGINE</key>
-        <string>ollama</string>
+        <string>openai</string>
+        <key>LTS_STT_BASE_URL</key>
+        <string>http://192.168.0.99:4000/v1</string>
+        <key>LTS_STT_API_KEY</key>
+        <string>__REPLACE_WITH_API_KEY__</string>
         <key>LTS_MODEL</key>
         <string>whisper-large-v3-turbo</string>
-        <key>LTS_OLLAMA_BASE_URL</key>
-        <string>http://127.0.0.1:11434</string>
     </dict>
 
     <!-- Run on user login; restart on crash. -->
