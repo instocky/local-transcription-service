@@ -73,6 +73,7 @@ class Job:
     next_retry_at: datetime | None = None
     transcript_path: str | None = None
     error: JobError | None = None
+    acked_at: datetime | None = None  # HLD-001 §13.1
 
     def to_row(self) -> dict[str, object]:
         """Serialize to a dict matching the SQLite schema in HLD-001 §7."""
@@ -91,6 +92,7 @@ class Job:
             "error_code": self.error.code if self.error else None,
             "error_message": self.error.message if self.error else None,
             "error_retryable": int(self.error.retryable) if self.error else None,
+            "acked_at": _iso(self.acked_at),
         }
 
     @classmethod
@@ -120,6 +122,9 @@ class Job:
             ),  # type: ignore[arg-type]
             transcript_path=row["transcript_path"],
             error=error,
+            acked_at=(
+                _from_iso(row["acked_at"]) if row["acked_at"] else None  # type: ignore[arg-type]
+            ),
         )
 
 

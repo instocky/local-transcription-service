@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     transcript_path TEXT,
     error_code      TEXT,
     error_message   TEXT,
-    error_retryable INTEGER
+    error_retryable INTEGER,
+    acked_at        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status_lease
@@ -68,6 +69,8 @@ class JobStore:
                 cols = {row[1] for row in await cur.fetchall()}
             if "next_retry_at" not in cols:
                 await db.execute("ALTER TABLE jobs ADD COLUMN next_retry_at TEXT")
+            if "acked_at" not in cols:
+                await db.execute("ALTER TABLE jobs ADD COLUMN acked_at TEXT")
             await db.commit()
 
     # ---------- submission ----------
@@ -288,6 +291,77 @@ class JobStore:
                     "job_id": job_id,
                     "token": lease_token,
                 },
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    # ---------- ack lifecycle (HLD-001 §13.1, Phase C) ----------
+
+    async def mark_acked(self, job_id: str) -> tuple[Job, bool]:
+        """Idempotently set ``acked_at = now(UTC)`` for a DONE job.
+
+        Returns ``(job, newly_acked)``:
+
+        - ``newly_acked=True`` — this call was the one that wrote ``acked_at``.
+        - ``newly_acked=False`` — the job was already acked; the returned
+          row has the original ``acked_at``.
+
+        Pre-conditions (caller is expected to have checked the job
+        state via :meth:`get`): the job exists and is in DONE. This
+        method's atomic UPDATE itself enforces both: the WHERE clause
+        requires ``status = 'done' AND acked_at IS NULL``, so the
+        rowcount tells us which case we hit.
+
+        Three observable outcomes from one call:
+
+        1. Job exists, status=DONE, acked_at IS NULL → rowcount=1,
+           newly_acked=True.
+        2. Job exists, status=DONE, acked_at NOT NULL → rowcount=0,
+           newly_acked=False (already acked).
+        3. Job missing OR status != DONE → rowcount=0; the caller
+           should re-fetch and inspect ``job.status`` to decide
+           whether to surface 404 vs 409. The store does not raise
+           here — the endpoint owns the HTTP mapping.
+
+        Filename move is the caller's responsibility — see
+        ``api.jobs.ack_job`` for the FS handoff.
+        """
+        now = datetime.now(UTC)
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute(
+                """
+                UPDATE jobs
+                SET acked_at = :now
+                WHERE job_id = :job_id
+                  AND status = 'done'
+                  AND acked_at IS NULL
+                """,
+                {"now": _iso(now), "job_id": job_id},
+            ) as cursor:
+                updated = cursor.rowcount
+            await db.commit()
+        job = await self.get(job_id)
+        # `get` already returns None for missing rows.
+        assert job is not None  # race: someone deleted the row between two connections
+        return job, updated > 0
+
+    async def update_transcript_path(self, job_id: str, transcript_path: str) -> bool:
+        """Replace the ``transcript_path`` column for a single job.
+
+        Used after the FS move in the ack handler — the file is now
+        in ``${LTS_DATA_DIR}/trash/{job_id}.md`` and the DB path must
+        follow so subsequent ``GET /jobs/{id}/result`` polls stream
+        from the right location (HLD-001 §13.1).
+
+        Returns ``True`` if a row was updated. The path is overwritten
+        unconditionally — there is no race here because the column
+        is only written by this method and the move is gated on a
+        successful ``mark_acked``.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            cursor = await db.execute(
+                "UPDATE jobs SET transcript_path = ? WHERE job_id = ?",
+                (transcript_path, job_id),
             )
             await db.commit()
             return cursor.rowcount > 0

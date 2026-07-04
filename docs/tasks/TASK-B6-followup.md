@@ -4,8 +4,8 @@
 |-------------|-----------------------------------------------------------------------------|
 | Phase       | B (post-merge follow-up)                                                    |
 | Depends on  | TASK-B-real-pipeline (b1–b5 all PASS; b5 verdict = accept with FAIL on item 1) |
-| Branch      | `feature/phase-b-real-pipeline` (HEAD = `87c470a`)                          |
-| Status      | READY — Tech Lead signed off on recs 2026-07-04; coder to launch             |
+| Branch      | `feature/phase-b-real-pipeline` → merged to `main`                          |
+| Status      | DONE 2026-07-04 — merged into `main` at HEAD `d492088`; Phase C started         |
 | HLD         | HLD-001 §4 (amended), §11, §12                                              |
 | ADR         | ADR-012 unchanged (STT stays local)                                         |
 

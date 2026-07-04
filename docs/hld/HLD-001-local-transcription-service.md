@@ -207,9 +207,18 @@ Response (200 OK):
   "finished_at": null,
   "error": null,
   "transcript": null,
-  "transcript_path": null
+  "transcript_path": null,
+  "acked_at": null
 }
 ```
+
+`acked_at` (added Phase C, 2026-07-04) carries the ISO 8601 UTC
+timestamp of the first successful `POST /jobs/{job_id}/ack`, or
+`null` if the job has never been acked. Same value as the
+`AckResponse.acked_at` returned by the ack endpoint, preserved
+idempotently across retries. Lets the extension confirm "the
+download was acknowledged" from a poll cycle alone — no separate
+ack probe required.
 
 When `status == "done"`:
 
@@ -447,7 +456,90 @@ The API returns both the inline `transcript` text and a
 extra read); the path lets other tools (or future features) reach
 the canonical file directly.
 
-Retention policy: **see Open Decision O-4 below.**
+### 13.1 Lifecycle & ack (O-4 operational details, Phase C, 2026-07-04)
+
+After the extension confirms a successful download, it MUST call
+`POST /jobs/{job_id}/ack`. The service then:
+
+1. Sets `jobs.acked_at` (UTC, ISO 8601) — idempotency marker.
+2. Atomically moves the transcript file from its current path
+   (typically `${LTS_DATA_DIR}/results/{job_id}.md`) into
+   `${LTS_DATA_DIR}/trash/`, preserving the basename (same
+   filesystem = atomic on POSIX; on Windows `os.replace` is atomic
+   on the same volume). The destination is named after the source
+   file so an operator who relocated the file earlier keeps that
+   basename.
+3. Updates `transcript_path` in the DB to reflect the new location
+   so subsequent reads (e.g. an extension retry after a network
+   glitch) follow the file.
+
+The endpoint is **idempotent at the contract layer**:
+
+- `acked_at` is set on the first successful call and preserved on
+  retries — never overwritten with "now" again.
+- The FS move is **re-attempted on every call** when the file is
+  not already in the trash (i.e. a prior move failed or the
+  operator fixed a transient issue between calls). This is what
+  makes a retry-after-transient-FS-issue converge instead of
+  leaving the file stranded.
+- `transcript_moved` reflects the *current* filesystem state
+  (file in trash after this call), independent of whether *this*
+  call did the rename — so the extension can reconcile on retry
+  without a separate status probe.
+- `GET /jobs/{id}` and `GET /jobs/{id}/result` continue to work
+  after ack — `result` reads from the trash path the DB now points
+  at. (Operators handle dump-the-trash manually.)
+
+Status codes:
+
+| Code | When                                                                                  |
+|------|---------------------------------------------------------------------------------------|
+| 503  | Database write failed. Two sub-cases — surfaced uniformly as `503 DB_UNAVAILABLE` (the endpoint catches `aiosqlite.Error` / `sqlite3.Error` around the entire DB-touching block). For both, retrying the ack converges: (a) `mark_acked` fails before any FS work — trivial retry; (b) `update_transcript_path` fails after a successful `move_to_trash` — the file is already in `trash/`, the retry auto-discovers the canonical trash path and heals the DB (Phase C P1, 2026-07-04). |
+
+**Why POST (not GET):** the original §17 O-4 wording said `GET`,
+but ack has a state-mutating side effect (file rename + DB
+update), so it MUST be `POST` per RFC 9110 §9.2.1. Phase C
+introduces this correction. Tracked in `docs/changelogs/`.
+
+**Failure-mode contract:**
+
+- DB write fails (any call in the DB-touching block — `mark_acked`,
+  `update_transcript_path`, or even the pre-flight `get`):
+  `503` with code `DB_UNAVAILABLE`. The endpoint catches
+  `aiosqlite.Error` / `sqlite3.Error` uniformly around the entire
+  block. The two sub-cases behave differently in the FS:
+    a. `mark_acked` (or pre-flight) fails before `move_to_trash`
+       ran → file is still at its source path. Retry is trivial
+       once the DB is recoverable.
+    b. `update_transcript_path` fails after a successful
+       `move_to_trash` → **partial state**: file is in `trash/`,
+       DB path is stale at the source. Retry **auto-discovers** the
+       canonical trash file and heals the DB (Phase C P1,
+       2026-07-04). `GET /jobs/{id}/result` recovers on the same
+       retry without operator intervention.
+  Response body carries an error message that names the underlying
+  exception for operator triage.
+- File move fails because source doesn't exist (operator cleanup
+  between retries, race against `mark_done`, manual delete from
+  `trash/`, the partial-state window from sub-case (b) above): `200`
+  with `transcript_moved=False`; logged warning; `acked_at` is set
+  if the DB write succeeded. The retry that follows
+  **auto-discovers** the canonical file in `trash/<basename>` and
+  uses it to heal the stale DB path — so the endpoint converges
+  after a partial failure (Phase C P1, 2026-07-04).
+- File move fails for any other reason (permission, cross-volume,
+  full filesystem): `200` with `transcript_moved=False`; logged
+  warning. Operator can drag the file to `trash/` manually; the
+  next ack call will see it already there and report
+  `transcript_moved=True`.
+
+**Why this ordering:** DB is the source of truth for "acked?". The
+FS move is a hygiene optimisation. Splitting them lets us keep
+the contract idempotent even when the FS move is flaky — the
+DB never goes back to "not acked" after a successful ack, and the
+FS move eventually converges across retries.
+
+Retention policy: **see Open Decision O-4.**
 
 ## 14. Network binding and auth
 
@@ -544,7 +636,7 @@ here so future readers can trace the rationale.
 | O-1 | STT model for MVP                                                                                                              | `whisper-large-v3-turbo` via whisper.cpp (Metal), fronted by LiteLLM. Configurable via `LTS_MODEL`.                                                          |
 | O-2 | LAN access needed? What auth?                                                                                                  | **LAN access needed.** Bind to Mac Mini LAN IP (`192.168.0.99:8766`). Auth = shared secret via `X-Auth-Token` header + `LTS_AUTH_TOKEN` env.              |
 | O-3 | Audio sources beyond YouTube URLs                                                                                              | YouTube URLs only for MVP. Direct file URL / upload is a future HLD.                                                                                         |
-| O-4 | Result retention policy                                                                                                        | Move to `${LTS_DATA_DIR}/trash/{job_id}.md` after the extension confirms download via `GET /jobs/{id}/ack`. Manual cleanup of `trash/` thereafter.        |
+| O-4 | Result retention policy                                                                                                        | Move the transcript file into `${LTS_DATA_DIR}/trash/` (preserving the source basename — typically `{job_id}.md` in MVP since that is what Stage 3 writes) after the extension confirms download via `POST /jobs/{id}/ack`. Manual cleanup of `trash/` thereafter.            |
 | O-5 | Healthcheck depth: add `/ready`?                                                                                                | **Yes.** Verifies DB writable, `ffmpeg` present, STT engine ready (whisper model listed in LiteLLM `GET /v1/models`).                                       |
 | O-6 | Rate-limit on submission                                                                                                       | Trust the `X-Auth-Token` — token holder is the legitimate single user. No IP-based limit for MVP.                                                            |
 

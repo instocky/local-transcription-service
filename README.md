@@ -59,7 +59,7 @@ uv run local-transcription-service
 The service starts both the HTTP server and the background worker in
 the same process.
 
-## API surface (current — HLD-001 §6)
+## API surface (current — HLD-001 §6, §13.1)
 
 All routes below require the `X-Auth-Token` header (set in
 `LTS_AUTH_TOKEN`), except `/health` and `/ready` which are public
@@ -72,6 +72,7 @@ probes (HLD-001 §14).
 | POST   | `/jobs`                    | yes  | 202             | Submit a YouTube URL for transcription.  |
 | GET    | `/jobs/{job_id}`           | yes  | 200 / 404       | Poll job state. Includes `transcript` + `transcript_path` for DONE. |
 | GET    | `/jobs/{job_id}/result`    | yes  | 200 / 404 / 410 / 500 | Stream the finished transcript file. |
+| POST   | `/jobs/{job_id}/ack`       | yes  | 200 / 401 / 404 / 409 | Acknowledge a successful download; moves the transcript to `trash/` (HLD §13.1). Idempotent. |
 
 Submit a job:
 
@@ -118,23 +119,49 @@ curl http://192.168.0.99:8766/jobs/$JOB_ID -H "X-Auth-Token: $LTS_AUTH_TOKEN"
 - ✅ SQLite queue with lease-based single-flight claim, stale-worker protection.
 - ✅ Retry policy (HLD §10): `defer_retry` + `next_retry_at`, 30s backoff, `max_attempts=2`.
 - ✅ Background worker (`claim` + `reclaim` loops in the same event loop as uvicorn).
-- ✅ 118 tests passing (Phase A baseline + B1/B2/B3 work in progress), `ruff check` clean.
 
-**STT engine decided (2026-07-03, HLD §4 amended):** whisper.cpp (Metal) on the
-Mac Mini, fronted by the existing LiteLLM Proxy (`:4000`) via OpenAI
+**Phase B complete** (real pipeline, on top of Phase A):
+
+- ✅ Real pipeline: Stage 1 `yt-dlp` → Stage 2 `ffmpeg` (16 kHz mono WAV) → Stage 3
+  `LiteLLMWhisperSTT` (OpenAI multipart to LiteLLM). See
+  `docs/tasks/TASK-B-real-pipeline.md` for the per-stage spec.
+- ✅ Config migration: `LTS_OLLAMA_BASE_URL` → `LTS_STT_BASE_URL` + `LTS_STT_API_KEY`,
+  `LTS_STT_ENGINE=openai` (B5a).
+- ✅ Drift cleanup + B6 follow-up — flake fix on `test_run_forever_processes_multiple_jobs`,
+  plist migration to `LTS_STT_*`, `.mavis/` added to `.gitignore`, transcript
+  extension `.txt` → `.md` aligned with HLD §11/§13. See
+  `docs/changelogs/CHANGELOG.md` (2026-07-04 entry).
+- 153 tests passing (Phase B baseline), `ruff check` clean.
+
+**Phase C in flight** (HLD-001 §13.1 — closes O-4):
+
+- ✅ `POST /jobs/{job_id}/ack` — idempotent, sets `acked_at`, moves the transcript
+  from `results/` to `trash/`. FS move is re-attempted on each call when the file
+  isn't already in trash; auto-discovery in the move helper heals a stale DB path
+  after a partial `update_transcript_path` failure on a prior call. DB failures
+  surface as `503 DB_UNAVAILABLE`.
+- ✅ `GET /jobs/{id}` now exposes `acked_at` so the extension can confirm download
+  acknowledgement from a poll cycle alone. Pinned by
+  `test_get_job_after_ack_includes_acked_at_and_new_path`.
+- 184 tests passing (Phase B 153 + Phase C net +31, per user-side pytest run
+  2026-07-04). `ruff check` clean.
+  See `docs/changelogs/CHANGELOG.md` (2026-07-04 Phase C entry) for the
+  per-surface breakdown.
+- ⏳ `medium` vs `large-v3-turbo` benchmark (`scripts/whisper-macmini/bench-whisper.sh`)
+  — optional, kept open from Phase B.
+
+**STT engine** (HLD §4 amended 2026-07-03): whisper.cpp (Metal) on the Mac
+Mini, fronted by the existing LiteLLM Proxy (`:4000`) via OpenAI
 `/v1/audio/transcriptions`. The ollama path was rejected (no whisper STT
 endpoint). whisper-server is provisioned and live on `127.0.0.1:8779`
 (launchd, Apple M4, `large-v3-turbo`). See
 `docs/runbooks/whisper-macmini-provisioning.md` and `scripts/whisper-macmini/`.
 
-**Pending (Phase B):**
-
-- ⏳ Real pipeline: Stage 1 yt-dlp → Stage 2 ffmpeg (16 kHz mono WAV) → Stage 3
-  `LiteLLMWhisperSTT` (OpenAI multipart to LiteLLM). See `docs/tasks/TASK-B-real-pipeline.md`.
-- ✅ Config migration: `LTS_OLLAMA_BASE_URL` → `LTS_STT_BASE_URL` + `LTS_STT_API_KEY`,
-  `LTS_STT_ENGINE=openai` (B5a, this commit).
-- ⏳ `medium` vs `large-v3-turbo` benchmark (`scripts/whisper-macmini/bench-whisper.sh`).
-- ⏳ Result trash policy (HLD O-4): move to `trash/` after extension ack (separate task).
+**Phase B integration gate result (b5, 2026-07-03):** items 2/4/5/6 PASS,
+item 1 (`pytest`) FAIL on a pre-existing Phase A flake (now fixed in B6),
+item 3 (real-gateway smoke) **SKIP** — the Windows runner cannot reach
+`192.168.0.99:4000`. Manual smoke on a Mac Mini-reachable host is the
+last outstanding verification gate (extension-side, not blocking merge).
 
 ## Requirements
 

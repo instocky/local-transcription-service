@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import pytest
 import pytest_asyncio
 
 from local_transcription_service.models import JobError, JobStatus
@@ -439,3 +440,176 @@ async def test_ping_writable_returns_false_when_path_is_directory(
     store = JobStore(bad)
     # Do NOT call init() — we want to test the raw open behavior.
     assert await store.ping_writable() is False
+
+
+# ---------- mark_acked (HLD-001 §13.1, Phase C) ----------
+
+
+async def _make_done_job(store: JobStore) -> tuple[str, str]:
+    """Drive a submitted job all the way to DONE; return (job_id, lease_token)."""
+    await store.submit("https://example.com/watch?v=ack-me")
+    claimed = await store.claim()
+    assert claimed is not None
+    token = claimed.lease_token or ""
+    await store.mark_processing(claimed.job_id, lease_token=token)
+    assert await store.mark_done(
+        claimed.job_id,
+        lease_token=token,
+        transcript_path="/tmp/results/ack-me.md",
+    )
+    return claimed.job_id, token
+
+
+async def test_mark_acked_sets_acked_at_for_done_job(store: JobStore) -> None:
+    """First ack of a DONE job writes acked_at and reports newly_acked=True."""
+    job_id, _ = await _make_done_job(store)
+
+    job, newly_acked = await store.mark_acked(job_id)
+    assert newly_acked is True
+    assert job.acked_at is not None
+    assert job.acked_at.tzinfo is not None  # UTC
+
+
+async def test_mark_acked_is_idempotent(store: JobStore) -> None:
+    """Repeat ack on an already-acked job is a no-op and preserves the
+    original `acked_at` timestamp."""
+    job_id, _ = await _make_done_job(store)
+
+    first, newly_acked_1 = await store.mark_acked(job_id)
+    assert newly_acked_1 is True
+
+    second, newly_acked_2 = await store.mark_acked(job_id)
+    assert newly_acked_2 is False
+    # Idempotent: original timestamp preserved.
+    assert second.acked_at == first.acked_at
+
+
+async def test_mark_acked_returns_none_for_unknown_job(store: JobStore) -> None:
+    """No row means no UPDATE, so the assertion in mark_acked (and the
+    HTTP 404 path) trigger. The store asserts post-fetch; ensure the
+    KeyError path doesn't leak to the caller via a pre-check."""
+    with pytest.raises(AssertionError):
+        # The store contract is "row exists when this returns"; missing
+        # rows should have been filtered by the endpoint's pre-flight.
+        await store.mark_acked("does-not-exist")
+
+
+async def test_mark_acked_no_op_for_queued_job(store: JobStore) -> None:
+    """A QUEUED job cannot be acked: rowcount=0, status unchanged."""
+    job = await store.submit("https://example.com/watch?v=q")
+    _, newly_acked = await store.mark_acked(job.job_id)
+    assert newly_acked is False
+    refreshed = await store.get(job.job_id)
+    assert refreshed is not None
+    assert refreshed.status == JobStatus.QUEUED
+    assert refreshed.acked_at is None
+
+
+async def test_mark_acked_no_op_for_claimed_job(store: JobStore) -> None:
+    """A CLAIMED job cannot be acked: rowcount=0, status unchanged.
+    (The atomic UPDATE filters on `status = 'done'`; CLAIMED is rejected
+    by the WHERE clause.)"""
+    await store.submit("https://example.com/watch?v=c")
+    claimed = await store.claim()
+    assert claimed is not None
+    _, newly_acked = await store.mark_acked(claimed.job_id)
+    assert newly_acked is False
+    refreshed = await store.get(claimed.job_id)
+    assert refreshed is not None
+    assert refreshed.status == JobStatus.CLAIMED
+
+
+async def test_mark_acked_no_op_for_processing_job(store: JobStore) -> None:
+    """PROCESSING is filtered out the same way."""
+    await store.submit("https://example.com/watch?v=p")
+    claimed = await store.claim()
+    assert claimed is not None
+    token = claimed.lease_token or ""
+    await store.mark_processing(claimed.job_id, lease_token=token)
+    _, newly_acked = await store.mark_acked(claimed.job_id)
+    assert newly_acked is False
+    refreshed = await store.get(claimed.job_id)
+    assert refreshed is not None
+    assert refreshed.status == JobStatus.PROCESSING
+
+
+async def test_mark_acked_no_op_for_failed_job(store: JobStore) -> None:
+    """FAILED is terminal and cannot be acked."""
+    await store.submit("https://example.com/watch?v=f")
+    claimed = await store.claim()
+    assert claimed is not None
+    token = claimed.lease_token or ""
+    await store.mark_processing(claimed.job_id, lease_token=token)
+    await store.mark_failed(
+        claimed.job_id,
+        lease_token=token,
+        error=JobError(code="X", message="x", retryable=False),
+    )
+    _, newly_acked = await store.mark_acked(claimed.job_id)
+    assert newly_acked is False
+    refreshed = await store.get(claimed.job_id)
+    assert refreshed is not None
+    assert refreshed.status == JobStatus.FAILED
+
+
+# ---------- update_transcript_path (Phase C) ----------
+
+
+async def test_update_transcript_path_persists(store: JobStore) -> None:
+    job_id, _ = await _make_done_job(store)
+    new_path = "/tmp/trash/job-md.md"
+    ok = await store.update_transcript_path(job_id, new_path)
+    assert ok is True
+    refreshed = await store.get(job_id)
+    assert refreshed is not None
+    assert refreshed.transcript_path == new_path
+
+
+async def test_update_transcript_path_returns_false_for_unknown(
+    store: JobStore,
+) -> None:
+    ok = await store.update_transcript_path("does-not-exist", "/tmp/x.md")
+    assert ok is False
+
+
+# ---------- init() migration (Phase C: acked_at column) ----------
+
+
+async def test_init_adds_acked_at_column_to_pre_existing_db(tmp_path) -> None:
+    """`init()` must add the `acked_at` column to a DB that pre-dates
+    this column (idempotent migration; same pattern as next_retry_at)."""
+    import aiosqlite
+
+    db_path = tmp_path / "legacy.db"
+    # Create a "legacy" DB with the pre-acked_at schema.
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.execute(
+            """
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                video_url TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                next_retry_at TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                transcript_path TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                error_retryable INTEGER
+            )
+            """
+        )
+        await db.commit()
+
+    # Now run init() — it must add the missing column.
+    store = JobStore(db_path)
+    await store.init()
+
+    async with aiosqlite.connect(str(db_path)) as db:
+        async with db.execute("PRAGMA table_info(jobs)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+    assert "acked_at" in cols
