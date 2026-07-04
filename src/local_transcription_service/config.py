@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     max_attempts: int = 2
     retry_backoff_seconds: int = 30
 
+    # --- Worker concurrency (HLD-001 §5 amended 2026-07-04, Phase D) ---
+    # Number of claim loops running cooperatively in the same event loop.
+    # SQLite's write-lock is the throughput ceiling, so going past the
+    # number of P-cores (4 on an M4 Mac Mini) yields diminishing returns.
+    # Range enforced via pydantic: ge=1 prevents the "zero workers"
+    # ambiguity (would mean "HTTP-only service"), le=64 prevents typos.
+    worker_count: int = Field(default=1, ge=1, le=64)
+
     # --- STT engine (HLD-001 §4, amended 2026-07-03) ---
     # `openai` = LiteLLM/Whisper.cpp gateway (production default);
     # `mock`   = deterministic in-process engine for CI / dev.

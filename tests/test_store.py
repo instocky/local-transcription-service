@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 
+from local_transcription_service.config import Settings
 from local_transcription_service.models import JobError, JobStatus
 from local_transcription_service.queue.store import JobStore
 
@@ -613,3 +615,75 @@ async def test_init_adds_acked_at_column_to_pre_existing_db(tmp_path) -> None:
         async with db.execute("PRAGMA table_info(jobs)") as cur:
             cols = {row[1] for row in await cur.fetchall()}
     assert "acked_at" in cols
+
+
+# ---------- multi-worker safety (HLD-001 §5 amended, Phase D) ----------
+
+
+async def test_concurrent_reclaim_is_safe(store: JobStore) -> None:
+    """20 concurrent reclaim_expired() calls against 10 expired leases
+    → exactly 10 jobs return to QUEUED, the rest are no-ops.
+
+    Pins the atomic-reclaim property of the SQL — the WHERE clause
+    ``lease_expires_at < ?`` filters the set per call, so two
+    concurrent reclaims see disjoint subsets (or the same subset
+    twice; the second one finds no rows to update because the
+    lease is already NULL).
+    """
+    # Set up 10 expired claimed jobs.
+    expired_ids: set[str] = set()
+    for i in range(10):
+        await store.submit(f"https://www.youtube.com/watch?v=conc{i}")
+        claimed = await store.claim(lease_ttl_seconds=60)
+        assert claimed is not None
+        # Force the lease into the past.
+        past = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
+        async with aiosqlite.connect(str(store._db_path)) as db:  # noqa: SLF001
+            await db.execute(
+                "UPDATE jobs SET lease_expires_at=? WHERE job_id=?",
+                (past, claimed.job_id),
+            )
+            await db.commit()
+        expired_ids.add(claimed.job_id)
+
+    # 20 concurrent reclaims. Each returns the count it reclaimed;
+    # the SUM must equal the total jobs reclaimed (10), because once
+    # a job is moved back to QUEUED, subsequent reclaims find nothing.
+    counts = await asyncio.gather(
+        *[store.reclaim_expired() for _ in range(20)],
+        return_exceptions=False,
+    )
+    total_reclaimed = sum(counts)
+
+    assert total_reclaimed == 10, f"expected 10 reclaimed, got {total_reclaimed}"
+
+    # All 10 jobs are back in QUEUED with lease_token NULL.
+    for jid in expired_ids:
+        after = await store.get(jid)
+        assert after is not None
+        assert after.status == JobStatus.QUEUED
+        assert after.lease_token is None
+
+
+async def test_busy_timeout_set_on_every_connection(
+    settings: Settings, store: JobStore
+) -> None:
+    """`PRAGMA busy_timeout = 5000` is set on every connection opened
+    via ``store._connect()`` — pin the property so a future refactor
+    that bypasses the helper fails loudly.
+
+    Note: SQLite's ``busy_timeout`` is per-connection. A raw
+    aiosqlite connection opened without going through the helper
+    may inherit some default from the Python sqlite3 module —
+    what matters is that the helper's connection has the value
+    we picked (5000 ms).
+    """
+    async with store._connect() as helper_db:  # noqa: SLF001
+        async with helper_db.execute("PRAGMA busy_timeout") as cur:
+            row = await cur.fetchone()
+    helper_timeout = row[0] if row else 0
+
+    assert helper_timeout == 5000, (
+        f"helper busy_timeout={helper_timeout}, expected 5000 — "
+        f"the helper must set the pragma before yielding the connection"
+    )

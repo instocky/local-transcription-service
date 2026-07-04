@@ -107,6 +107,7 @@ curl http://192.168.0.99:8766/jobs/$JOB_ID -H "X-Auth-Token: $LTS_AUTH_TOKEN"
 | `LTS_RECLAIM_INTERVAL_SECONDS` | `30`             | §8          | How often the reclaim loop runs. |
 | `LTS_MAX_ATTEMPTS`     | `2`                      | §10         | Max processing attempts per job. |
 | `LTS_RETRY_BACKOFF_SECONDS` | `30`                 | §10         | Delay between retry attempts for retryable failures. |
+| `LTS_WORKER_COUNT`     | `1`                      | §5          | Number of concurrent claim loops in the same process (Phase D). Range `1..64`. SQLite write-lock is the ceiling — past the P-core count (4 on an M4 Mac Mini) yields diminishing returns. |
 
 ## Status
 
@@ -149,6 +150,38 @@ curl http://192.168.0.99:8766/jobs/$JOB_ID -H "X-Auth-Token: $LTS_AUTH_TOKEN"
   per-surface breakdown.
 - See `docs/tasks/TASK-C-ack-and-retention.md` for the task spec + acceptance
   criteria; status flipped to **DONE** at HEAD `150c43d`.
+
+**Phase D complete** (HLD-001 §5 / §13.2 / §15 / §16 — operational hardening):
+
+- ✅ **D1 — Trash retention.** `lts-trash-cleanup` CLI (`python -m
+  local_transcription_service.retention`) deletes files from `trash/`
+  older than `LTS_TRASH_TTL_DAYS` (default `7`) or until the dir fits
+  under `LTS_TRASH_MAX_BYTES` (default `512 MiB`). Daily tick at 04:00
+  local via `scripts/launchd/com.local-transcription-service.trash-cleanup.plist`
+  (`StartCalendarInterval`, `RunAtLoad=false`). `--dry-run` for operator
+  preview. Pinned by 27 cases in `tests/test_retention.py`.
+- ✅ **D2 — Multi-worker.** New env var `LTS_WORKER_COUNT` (default `1`,
+  range `1..64`). Worker spawns N cooperative claim tasks in the same
+  event loop (each tagged with `worker_id=f"w{i}"` in structured logs).
+  Reclaim loop stays single — it is already idempotent. SQLite
+  `PRAGMA busy_timeout=5000` set on every connection so `/ready`
+  waits on the write lock instead of failing fast. Race-condition audit
+  in HLD §5.2 — every existing UPDATE is already safe under
+  `LTS_WORKER_COUNT > 1`.
+- ✅ **D3 — Production hardening.**
+  - `metrics.ErrorRateCounter` emits `error_rate_tick` every 60 s
+    with per-code counts (HLD §15.1; no Prometheus endpoint, the
+    log feed is the dashboard).
+  - `app.main()` runs a startup STT-readiness probe (`is_ready()`
+    under 5 s); failure exits `78` (`EX_CONFIG`) so launchd does
+    not auto-restart on a broken dependency (HLD §16.1).
+  - `scripts/launchd/local-transcription-service.conf` — `newsyslog`
+    config rotates both log files at 10 MiB / day, keep 5
+    generations, bzip2'd (HLD §16.2).
+- 210 tests passing (Phase C 184 + Phase D net +26 retention + 6 new
+  metric/worker/config), `ruff check` clean.
+- See `docs/tasks/TASK-D-trash-retention-multi-worker-hardening.md`
+  for the task spec + acceptance criteria.
 
 ### Open follow-ups (not blocking MVP)
 

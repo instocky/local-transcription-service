@@ -235,3 +235,75 @@ def test_stt_api_key_env_var(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
 
     s = Settings()
     assert s.stt_api_key == "sk-litellm-master-key"
+
+
+# ---------- Phase D: LTS_WORKER_COUNT (HLD-001 §5) ----------
+
+
+def test_worker_count_default_is_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """`LTS_WORKER_COUNT` defaults to 1 — backward-compatible single-worker."""
+    monkeypatch.setenv("LTS_AUTH_TOKEN", _VALID_TOKEN)
+    monkeypatch.setenv("LTS_STT_ENGINE", "mock")
+    monkeypatch.setenv("LTS_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("LTS_WORKER_COUNT", raising=False)
+
+    s = Settings()
+    assert s.worker_count == 1
+
+
+def test_worker_count_env_var_picks_up_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """`LTS_WORKER_COUNT=4` is picked up at parse time."""
+    monkeypatch.setenv("LTS_AUTH_TOKEN", _VALID_TOKEN)
+    monkeypatch.setenv("LTS_STT_ENGINE", "mock")
+    monkeypatch.setenv("LTS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LTS_WORKER_COUNT", "4")
+
+    s = Settings()
+    assert s.worker_count == 4
+
+
+def test_worker_count_zero_rejected_by_ge_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """worker_count=0 → ValidationError (ge=1 prevents the "zero workers"
+    ambiguity — what would that mean? HTTP-only? Stuck?)."""
+    monkeypatch.setenv("LTS_AUTH_TOKEN", _VALID_TOKEN)
+    monkeypatch.setenv("LTS_STT_ENGINE", "mock")
+    monkeypatch.setenv("LTS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LTS_WORKER_COUNT", "0")
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings()
+    assert "worker_count" in str(exc_info.value)
+
+
+def test_worker_count_too_large_rejected_by_le_64(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """worker_count > 64 → ValidationError (le=64 prevents typo-bombs)."""
+    monkeypatch.setenv("LTS_AUTH_TOKEN", _VALID_TOKEN)
+    monkeypatch.setenv("LTS_STT_ENGINE", "mock")
+    monkeypatch.setenv("LTS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LTS_WORKER_COUNT", "999")
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings()
+    assert "worker_count" in str(exc_info.value)
+
+
+def test_worker_count_non_integer_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """worker_count='abc' → ValidationError (the field is `int`)."""
+    monkeypatch.setenv("LTS_AUTH_TOKEN", _VALID_TOKEN)
+    monkeypatch.setenv("LTS_STT_ENGINE", "mock")
+    monkeypatch.setenv("LTS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LTS_WORKER_COUNT", "not-a-number")
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings()
+    assert "worker_count" in str(exc_info.value)

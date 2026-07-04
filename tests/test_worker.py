@@ -263,3 +263,121 @@ async def test_run_forever_processes_multiple_jobs(
 
     assert done_count == 3
     assert await store.count_by_status(JobStatus.DONE) == 3
+
+
+# ---------- multi-worker (HLD-001 §5 amended, Phase D) ----------
+
+
+async def test_run_forever_with_worker_count_4_processes_concurrent_jobs(
+    settings: Settings, store: JobStore
+) -> None:
+    """8 jobs + worker_count=4 → all 8 reach DONE; deterministic drain
+    via per-job done-event (Phase B6 pattern).
+
+    Pins HLD-001 §5 amended: N claim tasks cooperatively drain the
+    queue without double-processing. SQLite's atomic claim
+    (`UPDATE ... WHERE status='queued'`) ensures each job is
+    processed exactly once even when 4 tasks race.
+    """
+    n_jobs = 8
+    for i in range(n_jobs):
+        await store.submit(f"https://www.youtube.com/watch?v=multi{i}")
+
+    done_count = 0
+    done_event = asyncio.Event()
+
+    def _on_done(job_id: str) -> None:
+        nonlocal done_count
+        done_count += 1
+        if done_count >= n_jobs:
+            done_event.set()
+
+    worker = Worker(
+        store,
+        MockPipeline(),
+        settings,
+        on_done=_on_done,
+        worker_count=4,
+    )
+
+    async def _stop_after_done() -> None:
+        await asyncio.wait_for(done_event.wait(), timeout=10.0)
+        worker.stop()
+
+    stop_task = asyncio.create_task(_stop_after_done())
+    await asyncio.wait_for(worker.run_forever(), timeout=10.0)
+    await stop_task
+
+    assert done_count == n_jobs
+    assert await store.count_by_status(JobStatus.DONE) == n_jobs
+
+
+async def test_concurrent_claim_only_one_worker_wins_per_job(
+    settings: Settings, store: JobStore
+) -> None:
+    """10 concurrent claim() calls against a 5-job queue → exactly 5
+    succeed, 5 return None.
+
+    Pins the atomic-claim property of the SQL — two concurrent tasks
+    cannot both win the same row because the WHERE clause filters
+    by `status='queued'` and the SET clause changes the status.
+    SQLite's per-statement write-lock serialises the two UPDATEs.
+    """
+    n_jobs = 5
+    for i in range(n_jobs):
+        await store.submit(f"https://www.youtube.com/watch?v=claim{i}")
+
+    results = await asyncio.gather(
+        *[store.claim(lease_ttl_seconds=60) for _ in range(10)],
+        return_exceptions=False,
+    )
+
+    succeeded = [r for r in results if r is not None]
+    failed = [r for r in results if r is None]
+
+    assert len(succeeded) == n_jobs, f"expected {n_jobs} winners, got {len(succeeded)}"
+    assert len(failed) == 10 - n_jobs
+
+    # Each winner has a unique job_id.
+    winner_ids = {r.job_id for r in succeeded}
+    assert len(winner_ids) == n_jobs
+
+
+async def test_concurrent_mark_processing_respects_lease(
+    settings: Settings, store: JobStore
+) -> None:
+    """Two tasks each claim a distinct job; both call mark_processing
+    with the WRONG lease_token → only the matching lease succeeds.
+
+    Pins the lease-token filter on mark_processing — the "stale
+    worker lost the lease" guard that prevents a reclaimed job
+    from being advanced by the wrong worker.
+    """
+    job_a = await store.submit("https://www.youtube.com/watch?v=lease_a")
+    job_b = await store.submit("https://www.youtube.com/watch?v=lease_b")
+
+    claimed_a = await store.claim(lease_ttl_seconds=60)
+    claimed_b = await store.claim(lease_ttl_seconds=60)
+    assert claimed_a is not None and claimed_b is not None
+    assert claimed_a.lease_token != claimed_b.lease_token
+
+    # Cross-call: A's worker tries B's job, B's worker tries A's job.
+    wrong_a = await store.mark_processing(
+        job_b.job_id, lease_token=claimed_a.lease_token,
+    )
+    wrong_b = await store.mark_processing(
+        job_a.job_id, lease_token=claimed_b.lease_token,
+    )
+
+    assert wrong_a is False, "wrong lease_token must NOT advance job_b"
+    assert wrong_b is False, "wrong lease_token must NOT advance job_a"
+
+    # Now the correct calls succeed.
+    right_a = await store.mark_processing(
+        job_a.job_id, lease_token=claimed_a.lease_token,
+    )
+    right_b = await store.mark_processing(
+        job_b.job_id, lease_token=claimed_b.lease_token,
+    )
+    assert right_a is True
+    assert right_b is True

@@ -18,6 +18,13 @@ the job with `next_retry_at = now + retry_backoff_seconds`
 (30 s by default). Non-retryable failures — and retryable
 failures that exhaust the attempt budget — go straight to
 FAILED (terminal).
+
+Multi-worker (HLD-001 §5 amended 2026-07-04, Phase D): the
+``worker_count`` constructor argument controls how many claim
+loops run cooperatively in the same event loop. Each claim task
+gets a stable ``worker_id`` (``f"w{i}"``) in structured log
+events so operators can correlate per-task activity. The
+reclaim loop stays single — it is already idempotent and cheap.
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from local_transcription_service.config import Settings
+from local_transcription_service.metrics import ErrorRateCounter, run_error_rate_loop
 from local_transcription_service.models import Job, JobError
 from local_transcription_service.pipeline.base import PipelineError, TranscriptionPipeline
 from local_transcription_service.queue.store import JobStore
@@ -55,6 +63,8 @@ class Worker:
         settings: Settings,
         *,
         on_done: Callable[[str], None] | None = None,
+        worker_count: int = 1,
+        error_rate_counter: ErrorRateCounter | None = None,
     ) -> None:
         """Construct the worker.
 
@@ -70,12 +80,25 @@ class Worker:
         worker can stay in the synchronous end-of-iteration code
         path. If a test needs to fan out asynchronously, it can
         schedule work from inside the callback.
+
+        ``worker_count`` (Phase D, HLD-001 §5 amended) controls how
+        many claim loops run cooperatively in the same event loop.
+        Default ``1`` preserves single-worker behaviour. Values
+        outside ``[1, 64]`` are rejected by ``Settings.worker_count``
+        via pydantic ``Field(ge=1, le=64)``.
+
+        ``error_rate_counter`` (Phase D, HLD-001 §15.1) is an optional
+        counter that is incremented on every terminal FAIL. Pass
+        ``None`` (default) to skip the metric; production wires
+        ``app.main()`` to pass a real instance.
         """
         self._store = store
         self._pipeline = pipeline
         self._settings = settings
         self._stop = asyncio.Event()
         self._on_done = on_done
+        self._worker_count = worker_count
+        self._error_rate_counter = error_rate_counter
 
     # ---------- lifecycle ----------
 
@@ -84,24 +107,54 @@ class Worker:
         self._stop.set()
 
     async def run_forever(self) -> None:
-        """Run claim and reclaim loops until `stop()` is called."""
-        claim_task = asyncio.create_task(self._claim_loop(), name="lts-claim")
+        """Run claim and reclaim loops until `stop()` is called.
+
+        Multi-worker (Phase D, HLD-001 §5 amended): spawns
+        ``worker_count`` claim tasks cooperatively in the same event
+        loop. Each task gets a stable ``worker_id`` (``f"w{i}"``) in
+        its structured log events. The reclaim loop stays single.
+
+        If an ``error_rate_counter`` was passed at construction, a
+        third task runs the 60-second tick loop in parallel.
+        """
+        claim_tasks = [
+            asyncio.create_task(self._claim_loop(worker_id=f"w{i}"), name=f"lts-claim-{i}")
+            for i in range(self._worker_count)
+        ]
         reclaim_task = asyncio.create_task(self._reclaim_loop(), name="lts-reclaim")
+        tasks = [*claim_tasks, reclaim_task]
+
+        rate_task: asyncio.Task[None] | None = None
+        if self._error_rate_counter is not None:
+            rate_task = asyncio.create_task(
+                run_error_rate_loop(
+                    self._error_rate_counter,
+                    stop_event=self._stop,
+                ),
+                name="lts-error-rate",
+            )
+            tasks.append(rate_task)
+
         try:
             await self._stop.wait()
         finally:
-            claim_task.cancel()
-            reclaim_task.cancel()
-            await asyncio.gather(claim_task, reclaim_task, return_exceptions=True)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # ---------- single-iteration entry points (test-friendly) ----------
 
-    async def process_one(self) -> bool:
+    async def process_one(self, *, worker_id: str = "w0") -> bool:
         """Process at most one job. Returns True if a job was processed.
 
         Respects `max_attempts`: if the just-claimed job's `attempt`
         counter has already exceeded the limit, it is marked FAILED
         with code `MAX_ATTEMPTS` and not re-run.
+
+        ``worker_id`` (Phase D) is included in every structured log
+        event for this iteration. Default ``"w0"`` preserves the
+        single-worker log shape; multi-worker tasks pass
+        ``f"w{i}"`` for ``i`` in ``range(worker_count)``.
         """
         job = await self._store.claim(
             lease_ttl_seconds=self._settings.lease_ttl_seconds,
@@ -120,7 +173,12 @@ class Worker:
                     retryable=False,
                 ),
             )
-            logger.info("job failed: max attempts", extra={"job_id": job.job_id})
+            logger.info(
+                "job failed: max attempts",
+                extra={"job_id": job.job_id, "worker_id": worker_id},
+            )
+            if self._error_rate_counter is not None:
+                self._error_rate_counter.increment("MAX_ATTEMPTS")
             return True
 
         moved = await self._store.mark_processing(
@@ -130,7 +188,7 @@ class Worker:
         if not moved:
             logger.info(
                 "claim lost before processing",
-                extra={"job_id": job.job_id},
+                extra={"job_id": job.job_id, "worker_id": worker_id},
             )
             return True
 
@@ -138,7 +196,7 @@ class Worker:
             text = await self._pipeline.transcribe(job.video_url, job_id=job.job_id)
         except Exception as exc:  # noqa: BLE001 - any pipeline failure is a job failure
             error = self._error_from_exception(exc)
-            await self._handle_pipeline_failure(job, error)
+            await self._handle_pipeline_failure(job, error, worker_id=worker_id)
             return True
 
         # HLD-001 §11 / §13: results are written as `.md` (not `.txt`).
@@ -156,10 +214,13 @@ class Worker:
         if not done:
             logger.warning(
                 "mark_done rejected (lease lost)",
-                extra={"job_id": job.job_id},
+                extra={"job_id": job.job_id, "worker_id": worker_id},
             )
         else:
-            logger.info("job done", extra={"job_id": job.job_id})
+            logger.info(
+                "job done",
+                extra={"job_id": job.job_id, "worker_id": worker_id},
+            )
             if self._on_done is not None:
                 self._on_done(job.job_id)
         return True
@@ -173,13 +234,22 @@ class Worker:
 
     # ---------- long-running loops ----------
 
-    async def _claim_loop(self) -> None:
-        """Continuously claim and process jobs, sleeping when idle."""
+    async def _claim_loop(self, *, worker_id: str = "w0") -> None:
+        """Continuously claim and process jobs, sleeping when idle.
+
+        ``worker_id`` is threaded through to :meth:`process_one` so
+        every structured log event in this iteration carries the
+        caller's stable identifier (Phase D, HLD §5).
+        """
         while not self._stop.is_set():
             try:
-                processed = await self.process_one()
+                processed = await self.process_one(worker_id=worker_id)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("claim loop iteration crashed: %s", exc)
+                logger.exception(
+                    "claim loop iteration crashed: %s",
+                    exc,
+                    extra={"worker_id": worker_id},
+                )
                 processed = False
             if not processed:
                 # Queue empty — short wait before next poll. The wait
@@ -190,7 +260,14 @@ class Worker:
                     pass
 
     async def _reclaim_loop(self) -> None:
-        """Periodically reclaim expired leases."""
+        """Periodically reclaim expired leases.
+
+        Stays single even under ``worker_count > 1`` (HLD §5 amended):
+        the SQL update is atomic at the SQLite statement level, so
+        two reclaim loops would race for the same row only to have
+        one of them no-op. One loop is cheaper and easier to reason
+        about.
+        """
         interval = self._settings.reclaim_interval_seconds
         while not self._stop.is_set():
             try:
@@ -230,11 +307,18 @@ class Worker:
         self,
         job: Job,
         error: JobError,
+        *,
+        worker_id: str = "w0",
     ) -> None:
         """Decide between defer_retry and mark_failed (HLD-001 §10).
 
         Retryable + attempt < max_attempts → defer with backoff.
         Anything else → terminal FAILED.
+
+        ``worker_id`` is threaded into every structured log event
+        here. The error-rate counter is incremented on the FAIL
+        path (not the defer path) — only terminal failures count
+        for the rate metric.
         """
         assert job.lease_token is not None
 
@@ -255,6 +339,7 @@ class Worker:
                         "attempt": job.attempt,
                         "next_retry_at": next_retry_at.isoformat(),
                         "error_code": error.code,
+                        "worker_id": worker_id,
                     },
                 )
                 return
@@ -262,7 +347,7 @@ class Worker:
             # mark_failed so the job doesn't get stuck in PROCESSING.
             logger.warning(
                 "defer_retry lost the lease, marking failed",
-                extra={"job_id": job.job_id},
+                extra={"job_id": job.job_id, "worker_id": worker_id},
             )
 
         await self._store.mark_failed(
@@ -272,8 +357,14 @@ class Worker:
         )
         logger.warning(
             "job failed",
-            extra={"job_id": job.job_id, "error_code": error.code},
+            extra={
+                "job_id": job.job_id,
+                "error_code": error.code,
+                "worker_id": worker_id,
+            },
         )
+        if self._error_rate_counter is not None:
+            self._error_rate_counter.increment(error.code)
 
 
 __all__ = ["Worker"]

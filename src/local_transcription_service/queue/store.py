@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
@@ -22,6 +24,16 @@ import aiosqlite
 from local_transcription_service.models import Job, JobError, JobStatus
 
 logger = logging.getLogger(__name__)
+
+# Per-connection SQLite write-lock wait cap (HLD-001 §5.3 amended,
+# Phase D, 2026-07-04). Setting this on every connection means the
+# /ready probe and any read path that briefly holds the write lock
+# wait up to 5 s instead of failing fast on `SQLITE_BUSY`. 5 s is
+# generous for a LAN tool and well below any interactive-recovery
+# budget. The claim path is unaffected — a busy claim just retries
+# on the next loop tick (which is also why we set the pragma
+# uniformly rather than only on the readiness probe).
+_BUSY_TIMEOUT_MS: Final[int] = 5_000
 
 _SCHEMA: Final[str] = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -53,6 +65,27 @@ class JobStore:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
 
+    @asynccontextmanager
+    async def _connect(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Open a connection with ``PRAGMA busy_timeout`` already applied.
+
+        Replaces ``async with aiosqlite.connect(self._db_path) as db:``
+        at every call site in this module. ``busy_timeout`` is per-
+        connection in SQLite, so the pragma is set here, immediately
+        after open, before any caller-side work — the same uniform
+        behaviour for every code path (claim, ack, reclaim,
+        read-only queries, ``/ready``'s ``ping_writable``).
+
+        ``async with aiosqlite.connect(...)`` is what actually opens
+        the low-level sqlite3.Connection — ``aiosqlite.connect()`` alone
+        returns a wrapper whose ``_connection`` is still ``None`` until
+        the context manager enters. The pragma MUST run after the
+        low-level connection exists, hence the ordering here.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            yield db
+
     async def init(self) -> None:
         """Open the database and apply schema. Idempotent.
 
@@ -62,7 +95,7 @@ class JobStore:
         fresh and pre-existing databases.
         """
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             await db.executescript(_SCHEMA)
             # Idempotent column adds for older DBs.
             async with db.execute("PRAGMA table_info(jobs)") as cur:
@@ -90,7 +123,7 @@ class JobStore:
             attempt=0,
             created_at=now,
         )
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO jobs (job_id, video_url, status, attempt, created_at)
@@ -133,7 +166,7 @@ class JobStore:
         lease_token = lease_token or secrets.token_urlsafe(16)
         expires_at = datetime.now(UTC) + timedelta(seconds=lease_ttl_seconds)
         now_iso = _iso(datetime.now(UTC))
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -170,7 +203,7 @@ class JobStore:
         Returns True on success.
         """
         now = datetime.now(UTC)
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 """
                 UPDATE jobs
@@ -197,7 +230,7 @@ class JobStore:
         late callback from a worker whose lease was reclaimed).
         """
         now = datetime.now(UTC)
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 """
                 UPDATE jobs
@@ -229,7 +262,7 @@ class JobStore:
         twice (e.g., from a stale worker), only the first call with
         the matching lease_token succeeds.
         """
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 """
                 UPDATE jobs
@@ -274,7 +307,7 @@ class JobStore:
         and `lease_token` matches — same stale-worker protection
         as the other transitions.
         """
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 """
                 UPDATE jobs
@@ -327,7 +360,7 @@ class JobStore:
         ``api.jobs.ack_job`` for the FS handoff.
         """
         now = datetime.now(UTC)
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 UPDATE jobs
@@ -358,7 +391,7 @@ class JobStore:
         is only written by this method and the move is gated on a
         successful ``mark_acked``.
         """
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE jobs SET transcript_path = ? WHERE job_id = ?",
                 (transcript_path, job_id),
@@ -377,7 +410,7 @@ class JobStore:
         is what `max_attempts` bounds (HLD-001 §10).
         """
         now_iso = _iso(datetime.now(UTC))
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 """
                 UPDATE jobs
@@ -412,7 +445,7 @@ class JobStore:
         so this is the natural place for a write-capability check.
         """
         try:
-            async with aiosqlite.connect(self._db_path) as db:
+            async with self._connect() as db:
                 await db.execute("BEGIN IMMEDIATE")
                 await db.execute("COMMIT")
         except Exception as exc:  # noqa: BLE001 - any failure means not writable
@@ -424,7 +457,7 @@ class JobStore:
 
     async def get(self, job_id: str) -> Job | None:
         """Fetch a job by id, or None if not found."""
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
@@ -442,7 +475,7 @@ class JobStore:
         limit: int = 100,
     ) -> list[Job]:
         """Fetch up to `limit` jobs in the given status, oldest first."""
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT * FROM jobs WHERE status = ? "
@@ -454,7 +487,7 @@ class JobStore:
 
     async def count_by_status(self, status: JobStatus) -> int:
         """Count jobs in a given status."""
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status = ?",
                 (status.value,),

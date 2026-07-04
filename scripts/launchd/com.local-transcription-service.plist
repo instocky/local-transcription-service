@@ -42,6 +42,8 @@
         <string>__REPLACE_WITH_API_KEY__</string>
         <key>LTS_MODEL</key>
         <string>whisper-large-v3-turbo</string>
+        <key>LTS_WORKER_COUNT</key>
+        <string>1</string>
     </dict>
 
     <!-- Run on user login; restart on crash. -->
