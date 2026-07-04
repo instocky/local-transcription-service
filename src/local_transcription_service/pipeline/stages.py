@@ -20,9 +20,13 @@ Error codes follow HLD-001 §12:
 
 - ``yt-dlp`` missing / non-zero (non-network) → ``FETCH_FAILED``,
   ``retryable=False``.
-- ``yt-dlp`` exits with a network marker on stderr → ``FETCH_FAILED``,
-  ``retryable=True`` (so a transient drop is retried after the §10
-  backoff).
+- ``yt-dlp`` exits with a permanent marker on stderr (SSL/cert,
+  client-cert load failure, ...) → ``FETCH_FAILED``,
+  ``retryable=False``. Retrying won't help until the operator
+  fixes the underlying configuration.
+- ``yt-dlp`` exits with a transient network marker on stderr →
+  ``FETCH_FAILED``, ``retryable=True`` (so a transient drop is
+  retried after the §10 backoff).
 - ``ffmpeg`` missing / non-zero / timeout → ``AUDIO_CONDITIONING_FAILED``,
   ``retryable=False``.
 
@@ -73,7 +77,22 @@ _NETWORK_ERROR_PATTERNS: tuple[str, ...] = (
     "remote end closed connection",
     "no address associated with hostname",
     "could not resolve host",
+)
+
+#: Substrings in yt-dlp stderr that indicate a permanent,
+#: operator-fixable error. Retrying will not help — these are
+#: configuration or environment mistakes that need a human
+#: (install the right CA bundle, fix the proxy allow-list, ...).
+#: Matched case-insensitively against the joined stderr text.
+#: Checked BEFORE the network list so a substring that matches
+#: both (none today) is classified as permanent.
+_PERMANENT_ERROR_PATTERNS: tuple[str, ...] = (
+    # SSL / TLS — pinned cert wrong, system CA bundle missing,
+    # self-signed cert in proxy chain, etc. Retrying with the same
+    # env will fail the same way until the operator fixes it.
     "ssl: certificate verify failed",
+    "certificate verify failed",
+    "unable to load client certificate",
 )
 
 
@@ -138,10 +157,15 @@ async def fetch_media(
     Errors (HLD-001 §12):
 
     - ``yt-dlp`` missing on ``$PATH`` → non-retryable ``FETCH_FAILED``.
-    - ``yt-dlp`` exits non-zero, no network marker on stderr → non-retryable ``FETCH_FAILED``.
-    - ``yt-dlp`` exits non-zero, stderr matches a network marker → retryable ``FETCH_FAILED``.
+    - ``yt-dlp`` exits non-zero, no network / permanent marker on
+      stderr → non-retryable ``FETCH_FAILED``.
+    - ``yt-dlp`` exits non-zero, stderr matches a permanent marker
+      (SSL/cert, ...) → non-retryable ``FETCH_FAILED``.
+    - ``yt-dlp`` exits non-zero, stderr matches a transient network
+      marker → retryable ``FETCH_FAILED``.
     - ``yt-dlp`` times out → retryable ``FETCH_FAILED``.
-    - ``yt-dlp`` exits 0 but produced no matching file → non-retryable ``FETCH_FAILED``.
+    - ``yt-dlp`` exits 0 but produced no matching file →
+      non-retryable ``FETCH_FAILED``.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
     output_template = str(cache_dir / f"{job_id}.%(ext)s")
@@ -168,6 +192,14 @@ async def fetch_media(
 
     if result.returncode != 0:
         stderr_text = result.stderr.decode("utf-8", errors="replace").lower()
+        # Permanent errors are checked first — they are operator-fixable
+        # misconfigurations (SSL/cert, ...) and retrying them just burns
+        # the attempt budget. The network list is the catch-all for
+        # transient problems that have a chance of clearing on retry.
+        if any(p in stderr_text for p in _PERMANENT_ERROR_PATTERNS):
+            snippet = result.stderr.decode("utf-8", errors="replace")[:500]
+            msg = f"yt-dlp permanent error (exit={result.returncode}): {snippet}"
+            raise PipelineError(msg, code="FETCH_FAILED", retryable=False)
         if any(p in stderr_text for p in _NETWORK_ERROR_PATTERNS):
             snippet = result.stderr.decode("utf-8", errors="replace")[:500]
             msg = f"yt-dlp network error (exit={result.returncode}): {snippet}"

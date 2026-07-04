@@ -273,6 +273,69 @@ async def test_fetch_media_exit_zero_but_no_file_is_non_retryable(
     assert exc_info.value.retryable is False
 
 
+async def test_fetch_media_ssl_verify_failed_is_non_retryable(
+    cache_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """yt-dlp exits with SSL/cert error on stderr → FETCH_FAILED, retryable=False.
+
+    Permanent operator-fixable misconfiguration (pinned cert wrong,
+    system CA bundle missing, ...). Retrying with the same env fails
+    the same way; the job should go to FAILED on first attempt so
+    the operator notices and fixes the cert chain rather than the
+    worker burning the retry budget on a doomed job.
+    """
+    rec = _Recorder()
+    monkeypatch.setattr(
+        stages,
+        "_run_subprocess",
+        _record_then_return(
+            rec,
+            _FakeProcResult(
+                returncode=1,
+                stderr=b"ERROR: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] "
+                b"certificate verify failed: unable to get local issuer certificate>",
+            ),
+        ),
+    )
+
+    with pytest.raises(PipelineError) as exc_info:
+        await fetch_media(cache_dir, "https://youtu.be/ssl", "job-ssl")
+    assert exc_info.value.code == "FETCH_FAILED"
+    assert exc_info.value.retryable is False
+    assert "permanent" in str(exc_info.value).lower() or "ssl" in str(exc_info.value).lower()
+
+
+async def test_fetch_media_permanent_pattern_wins_over_transient(
+    cache_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stderr that mentions both a permanent (SSL) and a transient
+    (network) marker is classified as permanent.
+
+    Defensive: the current pattern lists don't overlap, but if a
+    future yt-dlp release bundles them on one line the classifier
+    must still classify as non-retryable. Permanent is checked
+    first in fetch_media.
+    """
+    rec = _Recorder()
+    monkeypatch.setattr(
+        stages,
+        "_run_subprocess",
+        _record_then_return(
+            rec,
+            _FakeProcResult(
+                returncode=1,
+                stderr=b"ERROR: ssl: certificate verify failed; connection reset",
+            ),
+        ),
+    )
+
+    with pytest.raises(PipelineError) as exc_info:
+        await fetch_media(cache_dir, "https://youtu.be/both", "job-both")
+    assert exc_info.value.code == "FETCH_FAILED"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.retryable is False
+
+
 # ---------- Stage 2: condition_audio (ffmpeg) ----------
 
 
