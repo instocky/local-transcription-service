@@ -159,3 +159,182 @@ and resolved the engine. Findings (empirical, on the Mac Mini):
 - [ ] Error codes reconciled to the HLD set; base.py docstring updated.
 - [ ] `stt_engine=mock` still passes all Phase A tests in CI.
 - [ ] No new dependency added except via `uv add` (yt-dlp, httpx if needed); no `requirements.txt`.
+
+---
+
+## 9. Phase B integration report (2026-07-03, `b5-integration-gate`)
+
+Verifier session `mvs_539aa4b221a141ffa0dd54908211a5c5` ran the
+six-check integration gate against
+`feature/phase-b-real-pipeline @ 87c470a`. Verdict is below each
+check; full evidence is in the verifier deliverable
+`plan_e233ba8d/outputs/b5-integration-gate/deliverable.md`.
+
+| # | Check                                              | Result          |
+|---|----------------------------------------------------|-----------------|
+| 1 | `uv run pytest -q`                                 | **FAIL** (flake)|
+| 2 | `uv run ruff check .`                              | PASS            |
+| 3 | Smoke through real gateway (192.168.0.99:4000)     | **SKIP** (env)  |
+| 4 | Secret-scan tracked files (`sk-[a-z0-9]{20,}`)     | PASS            |
+| 5 | Branch scope: 3–5 commits covering b1–b4           | PASS            |
+| 6 | `.mavis/plans/` not committed                      | PASS            |
+
+### 9.1 Pytest (FAIL)
+
+First run reported **142 passed**, but that result was non-
+deterministic. Re-running the full suite flipped to
+**1 failed, 141 passed** (same shell, same code, same venv).
+The culprit is one and only one test:
+`tests/test_worker.py::test_run_forever_processes_multiple_jobs`
+(line 235). Isolating the file and running it five times in a
+row reproduced the non-determinism:
+
+| Run | Result | Detail                    |
+|-----|--------|---------------------------|
+| 1   | PASS   | done in 0.52s             |
+| 2   | FAIL   | `assert 1 == 3`           |
+| 3   | FAIL   | `assert 2 == 3`           |
+| 4   | PASS   | done in 0.34s             |
+| 5   | FAIL   | `assert 2 == 3`           |
+
+3 of 5 runs failed (60% flake rate). Producer's `142/142
+PASS` claim was a coincidence of timing, not a verified
+property.
+
+**Root cause (read-only inspection only — no fix
+applied):** the test schedules
+`worker.stop()` after `asyncio.sleep(0.2)` and asserts three
+SQLite round-trips (claim → mark_processing →
+pipeline.transcribe → mark_done) finish inside that window.
+`MockPipeline.transcribe` is instantaneous, so the bottleneck
+is the SQLite write-lock contention on Windows. The 200 ms
+budget is not a real-time guarantee and the assertion is
+wrong.
+
+**Provenance:** the test was introduced in Phase A
+(`53b2b89 feat: complete Phase A of local-transcription-service
+per HLD-001`) — `git log -S test_run_forever_processes_multiple_jobs`
+returns only that commit. Diffing `git log main..HEAD --
+tests/test_worker.py` shows Phase B touched only lines 30–31,
+52, 76, 101, 125–127, 158 (signature + `stt_engine="mock"` +
+error-code reconciliation to HLD set). The flaky test
+definition at line 235 was **not** modified by B1–B4. So
+this is a **pre-existing flake**, not a Phase B regression
+in the strict sense — but the gate requires `uv run pytest
+-q` to be reliable, and it is not.
+
+**Required to unblock (out of scope for this gate; sent back
+to the producer/test-writing role):**
+- Replace the 0.2 s sleep with a deterministic drain: assert
+  `store.count_by_status(JobStatus.DONE) >= 1` after a fixed
+  number of `worker.process_one()` calls, or use
+  `asyncio.sleep_for_termination` polling on the done count.
+- Pin Windows-aware timing tolerance, or add `@pytest.mark.flaky`
+  with explicit reruns if the design genuinely relies on
+  real-time guarantees.
+- Whatever the shape — the test as written is unshippable.
+
+### 9.2 Ruff (PASS)
+
+```
+$ uv run ruff check .
+All checks passed!
+```
+
+Exit 0, zero violations. (pyproject.toml selects E, F, I, B,
+UP, ASYNC; line-length 100.)
+
+### 9.3 Real-gateway smoke (SKIP)
+
+The Windows verifier runner cannot reach
+`192.168.0.99:4000`:
+- TCP `Test-NetConnection -ComputerName 192.168.0.99 -Port 4000`
+  hung past 15 s with no response (multiple independent
+  attempts; each required explicit outbound-network
+  permission from the runner's permission layer).
+- `$env:LTS_STT_API_KEY` is empty in this session; a `jfk.wav`
+  is not present locally either.
+
+Per the gate instructions ("If the mac is unreachable, mark
+this as SKIP (with reason) and do not FAIL the whole gate on
+connectivity alone"), this is recorded as **SKIP** rather than
+FAIL. The Phase B opt-in integration test for this gateway is
+described in §6 (skipped by default in CI), so the contract
+is honoured; the Tech-Lead should run the manual smoke on a
+machine that can reach the Mac Mini before sign-off.
+
+### 9.4 Secrets scan (PASS)
+
+```
+$ git grep -nE "sk-[a-z0-9]{20,}"
+(no output, exit 1 — grep convention)
+
+$ git ls-files | grep -F 'sk-'   # sanity check, non-regex
+docs/tasks/TASK-B-real-pipeline.md  # substring only — content is comment text
+```
+
+Confirmed no API key in tracked files. (The single hit in the
+sanity grep is a non-secret mention in this very task doc;
+the regex grep returns nothing.)
+
+### 9.5 Branch scope (PASS)
+
+```
+$ git log main..HEAD --oneline
+e7c8e5f feat(stt): add STTEngine protocol, LiteLLMWhisperSTT + MockSTT (B3)
+b196678 feat(pipeline): implement Stage 1 (yt-dlp) + Stage 2 (ffmpeg) + RealPipeline orchestrator (B1+B2)
+d7ccd3f feat(config): migrate to LTS_STT_BASE_URL / LTS_STT_API_KEY (B5a)
+8c3671a fix(health): align /ready STT probe with the openai / mock contract
+87c470a ﻿feat(pipeline): wire WhisperPipeline + DI + /ready engine.is_ready() dispatch (B4)
+```
+
+5 commits on top of `main`. Parent linkage is a clean
+linear chain (`git log main..HEAD --format="%H %p %s"`
+shows each commit's parent == prior commit). b1+b2 are
+combined into `b196678`; b3, b5a (config), health-fix,
+and b4 round out the branch. No reverts, no merges, no
+force-push evidence in reflog (the `reset: moving to HEAD`
+entries are local no-ops that preserve history).
+
+`git ls-remote origin feature/phase-b-real-pipeline`
+returns nothing — the branch has not been pushed yet. Local
+reflog shows clean commits only; no history rewrite. (Once
+pushed, `git log origin/main..HEAD` is the authoritative
+check.)
+
+### 9.6 `.mavis/plans/` not committed (PASS)
+
+```
+$ git ls-files .mavis
+(no output)
+
+$ git ls-files .mavis/plans
+(no output)
+
+$ git ls-files | grep -F '.mavis/plans'
+(no output)
+```
+
+`.mavis/` is untracked in the working tree and not part of
+any commit. `.gitignore` does not list it explicitly, but
+the verifier confirms it is excluded by virtue of being
+untracked. It would be cleaner to add `.mavis/` to
+`.gitignore` so a future `git add .` doesn't accidentally
+pull it in, but that's hygiene not a gate failure.
+
+### 9.7 Verdict
+
+**VERDICT: FAIL** on gate item 1 (pytest). Gate items 2, 4,
+5, 6 are clean. Gate item 3 is SKIP per scope. The flake
+predates Phase B (Phase A, commit 53b2b89), so this is not
+a Phase B regression in the strict sense — but
+`uv run pytest -q` is the literal gate command and it does
+not run reliably on the verifier's Windows runner, so the
+gate cannot be declared PASS until either the flake is fixed
+or its flakiness is acknowledged and contained (e.g.
+flaky-mark + reruns, or a deterministic rewrite of the
+test body).
+
+**Action requested:** hand the flake back to the producer
+(or a dedicated test-writing producer) for fix; do not
+merge until a clean `uv run pytest -q` run is reproducible.
