@@ -270,6 +270,44 @@ async def test_is_ready_sends_bearer_to_models(monkeypatch: pytest.MonkeyPatch) 
     assert captured[0].headers["authorization"] == f"Bearer {API_KEY}"
 
 
+def test_engine_readiness_timeout_defaults_to_5s() -> None:
+    """The default readiness timeout (5 s) is much shorter than the
+    transcription timeout (300 s) so the /ready probe does not hang
+    on a blackholed / slow gateway. Pin both defaults — operators
+    relying on a fast 503 must not have a future refactor silently
+    bump the readiness timeout.
+    """
+    engine = LiteLLMWhisperSTT()
+    assert engine._readiness_timeout_s == 5.0
+    assert engine._timeout_s == 300.0
+    assert engine._readiness_timeout_s < engine._timeout_s
+
+
+async def test_is_ready_passes_readiness_timeout_to_list_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """is_ready() must call _list_models with the short readiness
+    timeout (5 s), not the long transcription timeout (300 s). A
+    blackholed gateway must not turn the /ready probe into a
+    multi-minute hang for any LB / monitor polling it.
+    """
+    captured: list[float | None] = []
+    real_list_models = LiteLLMWhisperSTT._list_models
+
+    async def spy(
+        self: LiteLLMWhisperSTT, *, timeout_s: float | None = None
+    ) -> list[str]:
+        captured.append(timeout_s)
+        return await real_list_models(self, timeout_s=timeout_s)
+
+    monkeypatch.setattr(LiteLLMWhisperSTT, "_list_models", spy)
+    _install_transport(monkeypatch, lambda req: _models_ok())
+
+    await _make_engine().is_ready()
+
+    assert captured == [5.0]
+
+
 # ---------- env-var fallback (b3-config TODO) ----------
 
 

@@ -43,6 +43,13 @@ _DEFAULT_BASE_URL = "http://192.168.0.99:4000/v1"
 _DEFAULT_MODEL = "whisper-large-v3-turbo"
 # STT of a long audio file can legitimately take minutes on the gateway.
 _DEFAULT_TIMEOUT_S = 300.0
+# GET /models is a small JSON response and is also called by the
+# readiness probe (`is_ready`). A blackhole / slow-LAN gateway must
+# not make the probe hang for the full transcription timeout — that
+# would turn /ready from a fast 503 into a multi-minute timeout and
+# trip any LB / monitor that polls the probe. 5 s is generous for a
+# LAN gateway and short enough that the probe stays useful.
+_DEFAULT_READINESS_TIMEOUT_S = 5.0
 
 
 class LiteLLMWhisperSTT:
@@ -67,11 +74,13 @@ class LiteLLMWhisperSTT:
         api_key: str | None = None,
         model: str | None = None,
         timeout_s: float = _DEFAULT_TIMEOUT_S,
+        readiness_timeout_s: float = _DEFAULT_READINESS_TIMEOUT_S,
     ) -> None:
         self._base_url = (base_url or os.environ.get(_ENV_BASE_URL, _DEFAULT_BASE_URL)).rstrip("/")
         self._api_key = api_key if api_key is not None else os.environ.get(_ENV_API_KEY, "")
         self._model = model or os.environ.get(_ENV_MODEL, _DEFAULT_MODEL)
         self._timeout_s = timeout_s
+        self._readiness_timeout_s = readiness_timeout_s
 
     @property
     def model(self) -> str:
@@ -133,20 +142,35 @@ class LiteLLMWhisperSTT:
 
         Never raises: a gateway outage or a rejected request reports
         not-ready, per the `STTEngine` contract (HLD-001 §8).
+
+        Uses ``readiness_timeout_s`` (default 5 s) instead of the
+        long ``timeout_s`` reserved for actual transcription, so a
+        blackholed / slow gateway does not turn the /ready probe
+        into a multi-minute hang for any LB / monitor that polls it.
         """
         try:
-            models = await self._list_models()
-        except PipelineError:
+            models = await self._list_models(timeout_s=self._readiness_timeout_s)
+        except Exception:  # noqa: BLE001 — STTEngine contract: must not raise
+            logger.warning("is_ready: probe failed, reporting not ready", exc_info=True)
             return False
         return self._model in models
 
     # ---------- internals ----------
 
-    async def _list_models(self) -> list[str]:
-        """Return the model ids from `GET {base}/models` (OpenAI shape)."""
+    async def _list_models(self, *, timeout_s: float | None = None) -> list[str]:
+        """Return the model ids from `GET {base}/models` (OpenAI shape).
+
+        ``timeout_s`` defaults to ``self._timeout_s`` (the long
+        transcription timeout). Callers that need a tighter deadline
+        — currently ``is_ready`` — pass an explicit override; the
+        /ready probe must not block on a slow gateway for the full
+        transcription window.
+        """
+        if timeout_s is None:
+            timeout_s = self._timeout_s
         url = f"{self._base_url}/models"
         try:
-            async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
                 response = await client.get(url, headers=self._auth_headers)
         except httpx.RequestError as exc:
             raise self._gateway_unavailable("GET /models", exc) from exc
