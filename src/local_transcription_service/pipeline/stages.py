@@ -171,6 +171,21 @@ async def fetch_media(
     output_template = str(cache_dir / f"{job_id}.%(ext)s")
     argv = [
         ytdlp_bin,
+        # Ignore the operator's user/global yt-dlp config so the
+        # service's output shape does not depend on whatever the
+        # Mac Mini happens to have in ~/.config/yt-dlp/. Without
+        # this flag, an operator-side --write-info-json,
+        # --write-thumbnail, or custom postprocessor can drop
+        # sidecar files into audio-cache/ that the orchestrator's
+        # glob then picks up as the "media" file, feeding ffmpeg
+        # a .info.json or a thumbnail instead of audio.
+        "--ignore-config",
+        # Belt-and-braces: even with --ignore-config, also disable
+        # the two sidecar outputs at the CLI level so a future
+        # yt-dlp release or a wrapper script that re-introduces
+        # them cannot poison the cache.
+        "--no-write-info-json",
+        "--no-write-thumbnail",
         "--no-playlist",
         "--no-progress",
         "--no-part",

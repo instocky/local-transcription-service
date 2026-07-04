@@ -157,6 +157,43 @@ async def test_fetch_media_returns_produced_file_and_argv_shape(
     assert argv[-1] == "https://www.youtube.com/watch?v=abc"
 
 
+async def test_fetch_media_uses_deterministic_yt_dlp_flags(
+    cache_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """yt-dlp must ignore operator/user config and skip sidecar
+    outputs so the audio-cache/{job_id}.* glob never picks up an
+    .info.json, .webp thumbnail, or anything the operator's local
+    yt-dlp config might produce.
+
+    TL review (Phase B): without these flags a misconfigured
+    Mac Mini yt-dlp config (e.g. --write-info-json by default)
+    would drop sidecar files into the cache; the orchestrator's
+    ``sorted(...).*`` glob would then pick the first one and feed
+    a non-audio file to ffmpeg, surfacing as a confusing
+    AUDIO_CONDITIONING_FAILED on the user-facing job.
+    """
+    rec = _Recorder()
+    job_id = "job-flags"
+
+    def write_webm(argv, **_):
+        cache_dir.joinpath(f"{job_id}.webm").write_bytes(b"raw audio")
+        return _FakeProcResult(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(stages, "_run_subprocess", _record_then_return(rec, write_webm))
+
+    await fetch_media(cache_dir, "https://youtu.be/x", job_id)
+
+    (argv, _kwargs) = rec.calls[0]
+    # Ignore the operator's user/global config — the service's
+    # argv shape must be the only source of output policy.
+    assert "--ignore-config" in argv
+    # Belt-and-braces: also disable the two sidecar outputs at the
+    # CLI level so a future yt-dlp release or wrapper script
+    # cannot reintroduce them.
+    assert "--no-write-info-json" in argv
+    assert "--no-write-thumbnail" in argv
+
+
 async def test_fetch_media_missing_binary_is_non_retryable(
     cache_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
