@@ -1,0 +1,526 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Local Transcription Service",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Health",
+        "description": "Liveness probe. Returns 200 if the process can serve HTTP.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Health Health Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Ready",
+        "description": "Readiness probe. 200 if ready, 503 otherwise (HLD-001 \u00a78).\n\nBody is always the same `ReadinessReport.to_dict()` shape so\nclients can inspect individual checks regardless of status.",
+        "operationId": "ready_ready_get",
+        "responses": {
+          "200": {
+            "description": "All readiness checks passed",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "503": {
+            "description": "At least one readiness check failed"
+          }
+        }
+      }
+    },
+    "/jobs": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Submit Job",
+        "description": "Submit a video URL for transcription.\n\nHLD-001 \u00a76: returns 202 (not 201) and includes `poll_url` in\nthe response body so clients can start polling without\nconstructing the path themselves.",
+        "operationId": "submit_job_jobs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitJobRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Job accepted, see response body and Location header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubmitJobResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing X-Auth-Token"
+          },
+          "422": {
+            "description": "Invalid or non-YouTube video_url"
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Get Job",
+        "description": "Return current state of a job.\n\nFor DONE jobs, the response also includes `transcript` (the\nfull text) and `transcript_path` (HLD-001 \u00a76). The file is\nread off the event loop via `asyncio.to_thread` so a slow\ndisk doesn't block other requests.",
+        "operationId": "get_job_jobs__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStateResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing X-Auth-Token"
+          },
+          "404": {
+            "description": "Job not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/result": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Get Result",
+        "description": "Return the finished transcript file for a DONE job.\n\nStatus codes:\n- 200: text/plain transcript file.\n- 404: job not found, or not yet done (poll `/jobs/{id}` instead).\n- 410: job is in FAILED state (gone \u2014 won't ever produce a result).\n- 500: DB says DONE but the file is missing on disk.",
+        "operationId": "get_result_jobs__job_id__result_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transcript text",
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "text/plain": {}
+            }
+          },
+          "401": {
+            "description": "Invalid or missing X-Auth-Token"
+          },
+          "404": {
+            "description": "Job not found or not yet done"
+          },
+          "410": {
+            "description": "Job failed"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/ack": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Ack Job",
+        "description": "Mark a finished job as downloaded by the extension (HLD-001 \u00a713.1).\n\nBehaviour:\n\n- First call after ``mark_done``: sets ``acked_at``, moves the\n  transcript file from its current path into ``trash/`` (the\n  destination filename is preserved from the source \u2014 see\n  HLD \u00a713.1 for the rationale). Returns ``already_acked=False``.\n- Repeat call on an already-acked job: ``acked_at`` is preserved\n  (not bumped to \"now\"). The DB row is the source of truth; the\n  FS move is re-attempted iff the file is not actually in ``trash/``\n  AND exists on disk \u2014 so a retry after the operator clears a\n  transient FS problem (full disk, permission, manual cleanup)\n  eventually converges. Returns ``already_acked=True``.\n- For a non-DONE job (``queued``/``claimed``/``processing``/\n  ``failed``): ``409`` with ``code=\"NOT_DONE\"``. Acks are\n  meaningless before the transcript file exists.\n\n``transcript_moved`` reflects the **observed filesystem state at\nreturn time** \u2014 ``True`` iff the file path the DB points at\ncurrently exists on disk AND its parent is the trash directory.\nA pure path check is not enough: an operator may delete the file\nfrom trash manually, and a stale DB path would otherwise\nmislead the extension. With ``Path.exists()`` included, the\nfallback `move_to_trash` re-runs against the source path\n(no-op if source == destination), and the response surfaces\n``transcript_moved=False`` accurately.\n\nFailure handling is documented in HLD-001 \u00a713.1 (\"Failure-mode\ncontract\"). The short version:\n\n- DB write fails \u2192 ``503 Service Unavailable`` (mapped from\n  ``aiosqlite.Error`` / ``sqlite3.Error``). Two sub-cases:\n    a. ``mark_acked`` raises before any FS work happened \u2014\n       ``200`` retry is trivially safe.\n    b. ``update_transcript_path`` raises after a successful\n       FS move (the partial-state window) \u2014 the file is in\n       ``trash/`` but the DB path is stale. The retry\n       **auto-discovers** the canonical trash file via\n       ``move_to_trash`` and heals the DB path; ``GET\n       /jobs/{id}/result`` recovers. Pinned by\n       ``test_ack_converges_after_update_transcript_path_failure``.\n- FS move fails (any reason \u2014 permission, cross-volume, full disk,\n  source missing under no-canonical) \u2192 ``200`` with\n  ``transcript_moved=False``; ``acked_at`` is set if the DB\n  write succeeded. Operator can drag the file to ``trash/``\n  manually; a subsequent ack will report ``transcript_moved=True``\n  when the file lands there.",
+        "operationId": "ack_job_jobs__job_id__ack_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ack accepted (first call or idempotent retry)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AckResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing X-Auth-Token"
+          },
+          "404": {
+            "description": "Job not found"
+          },
+          "409": {
+            "description": "Job is not in DONE state \u2014 cannot ack"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AckResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "acked_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Acked At"
+          },
+          "already_acked": {
+            "type": "boolean",
+            "title": "Already Acked"
+          },
+          "transcript_moved": {
+            "type": "boolean",
+            "title": "Transcript Moved"
+          },
+          "transcript_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transcript Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "acked_at",
+          "already_acked",
+          "transcript_moved"
+        ],
+        "title": "AckResponse",
+        "description": "Response body for `POST /jobs/{job_id}/ack` (HLD-001 \u00a713.1).\n\nThe endpoint is idempotent: a repeated ack of an already-acked\njob returns 200 with ``already_acked=True`` and an unchanged\n``acked_at`` timestamp.\n\nField semantics:\n\n- ``transcript_moved`` \u2014 observed FS state at return time:\n  ``True`` iff the path the DB currently points at is on disk\n  inside the trash directory. ``False`` if the file is missing\n  (operator deletion between calls) or has not been moved yet.\n  This is what the extension reads as \"is the transcript\n  actually downloadable from your system?\".\n- ``transcript_path`` \u2014 the path the server currently believes\n  the transcript lives at, after this call. After a successful\n  first ack this is `${LTS_DATA_DIR}/trash/{filename}`. After a\n  retry that auto-healed a stale DB path (file actually at\n  trash, but a previous call's `update_transcript_path` failed),\n  this is also the canonical trash path discovered by\n  `move_to_trash`. May legitimately equal the old DB path with\n  ``transcript_moved=False`` when the file is missing\n  everywhere \u2014 the extension sees \"the file is gone, the path\n  I had isn't valid\", which is actionable.\n\nThe two fields together let the extension reconcile across\nretries without a separate filesystem probe."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "JobError": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "retryable": {
+            "type": "boolean",
+            "title": "Retryable"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "title": "JobError",
+        "description": "Structured error attached to a FAILED job."
+      },
+      "JobStateResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "video_url": {
+            "type": "string",
+            "title": "Video Url"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "transcript": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transcript"
+          },
+          "transcript_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transcript Path"
+          },
+          "acked_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Acked At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "video_url",
+          "status",
+          "attempt",
+          "created_at"
+        ],
+        "title": "JobStateResponse",
+        "description": "Response body for `GET /jobs/{id}` (HLD-001 \u00a76).\n\nField semantics:\n- `transcript`: full transcript text when `status == \"done\"`, else null.\n- `transcript_path`: file path on the server when done, else null.\n- `error`: structured `JobError` when `status == \"failed\"`, else null.\n- `acked_at`: ISO 8601 UTC timestamp of the first successful\n  `POST /jobs/{id}/ack`, or `null` if the job has not yet been\n  acked (or was never acked because it failed). Set on terminal\n  `done` jobs once the extension confirms download. Lets the\n  extension reconcile local state without a separate ack call.\n\n`error` is a dataclass; Pydantic v2 serializes it as a nested\nobject (code/message/retryable) via `arbitrary_types_allowed`."
+      },
+      "JobStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "claimed",
+          "processing",
+          "done",
+          "failed"
+        ],
+        "title": "JobStatus",
+        "description": "Job lifecycle states.\n\nSee HLD-001 Section 9 for the full state machine.\n\nTransitions:\n    QUEUED -> CLAIMED       (worker claim, attempt++)\n    CLAIMED -> PROCESSING   (worker starts pipeline)\n    CLAIMED|PROCESSING -> QUEUED  (lease expired, reclaim)\n    PROCESSING -> DONE      (success)\n    PROCESSING -> FAILED    (any failure, terminal)"
+      },
+      "SubmitJobRequest": {
+        "properties": {
+          "video_url": {
+            "type": "string",
+            "maxLength": 2083,
+            "minLength": 1,
+            "format": "uri",
+            "title": "Video Url",
+            "description": "YouTube video URL to transcribe (MVP restriction)"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "video_url"
+        ],
+        "title": "SubmitJobRequest",
+        "description": "Request body for `POST /jobs`.\n\n`video_url` is validated as a syntactically valid HTTP URL and\nthen narrowed to YouTube hosts only. Both checks happen at\ndeserialization time, so any non-YouTube URL yields a 422\nresponse before reaching the route handler."
+      },
+      "SubmitJobResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "poll_url": {
+            "type": "string",
+            "title": "Poll Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "status",
+          "poll_url"
+        ],
+        "title": "SubmitJobResponse",
+        "description": "Response body for `POST /jobs` (HTTP 202 Accepted, HLD-001 \u00a76).\n\n`poll_url` is a server-relative path the client can poll to read\njob state. We deliberately do NOT return a full URL \u2014 the\nservice is bound to a LAN IP and clients are expected to know\nthe base."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}
