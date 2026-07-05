@@ -91,6 +91,81 @@ Poll until `status == "done"`:
 curl http://192.168.0.99:8766/jobs/$JOB_ID -H "X-Auth-Token: $LTS_AUTH_TOKEN"
 ```
 
+## Deploying to the Mac Mini (Phase F, 2026-07-05)
+
+The service runs under launchd on the Mac Mini (Apple Silicon,
+LAN `192.168.0.99`) as a **system** LaunchDaemon — the same shape as
+the sibling `/opt/litellm` and `/opt/whisper` services. **No background
+process is left over from `uv run`.** Once installed, `sudo shutdown
+-r now` brings the service back automatically.
+
+> **Full architecture + recovery runbook:**
+> [`docs/runbooks/macmini-deployment.md`](docs/runbooks/macmini-deployment.md) — read this first if you need to recover from a reboot, rotate secrets, or restart the service after a config change.
+>
+> **Phase D ops (trash cleanup, newsyslog, multi-worker, probe):**
+> [`docs/runbooks/lts-operations.md`](docs/runbooks/lts-operations.md).
+
+### One-time install on the Mac Mini (SSH)
+
+```bash
+ssh uri@mac-mini-urij.local
+
+cd /opt/local-transcription-service && {
+  git config pull.ff only    # one-time, prevents uv.lock divergence
+  git pull
+
+  uv sync                    # picks up the runtime deps (httpx, yt-dlp)
+  chmod +x scripts/launchd/run.sh
+
+  sudo cp scripts/launchd/local.local-transcription-service.plist /Library/LaunchDaemons/
+  sudo chown root:wheel /Library/LaunchDaemons/local.local-transcription-service.plist
+  sudo chmod 644 /Library/LaunchDaemons/local.local-transcription-service.plist
+
+  sudo launchctl bootstrap system /Library/LaunchDaemons/local.local-transcription-service.plist
+}
+```
+
+`run.sh` reads `$HOME/.lts-env` for the runtime secret/env.
+First-time setup of that file:
+
+```bash
+cat > $HOME/.lts-env <<'EOF'
+LTS_AUTH_TOKEN=<shared-secret>           # 16+ chars; rotated separately, see BLG-003
+LTS_STT_API_KEY=<litellm-master-key>     # rotated separately, see BLG-003
+LTS_BIND_HOST=192.168.0.99
+LTS_PORT=8766
+LTS_DATA_DIR=/Users/uri/.local-transcription
+LTS_STT_BASE_URL=http://192.168.0.99:4000/v1
+LTS_STT_ENGINE=openai
+LTS_MODEL=whisper-large-v3-turbo
+LTS_WORKER_COUNT=1
+PATH=/opt/local-transcription-service/.venv/bin:$PATH
+EOF
+chmod 600 $HOME/.lts-env                 # see BLG-002
+```
+
+### Day-to-day ops
+
+```bash
+# Tail the service log
+tail -F /Users/uri/Library/Logs/local-transcription-service.out.log
+
+# Restart the service after a config / code change
+sudo launchctl kickstart -k system/com.local-transcription-service
+
+# Health probe (also tells the extension "ready to submit")
+curl http://192.168.0.99:8766/health
+```
+
+### Production prerequisites
+
+- `Cloudflare WARP` toggled on in the menu bar. There is **no auto-connect
+  on reboot** yet — see `BLG-001` in
+  [`docs/backlog.md`](docs/backlog.md). Until BLG-001 lands, you must
+  re-enable WARP after every `sudo shutdown -r now`.
+- `local.litellm` and `local.whisper` LaunchDaemons already up (they are
+  the same pattern as ours — installed and managed by the operator).
+
 ## Configuration
 
 | Env var                | Default                  | HLD ref     | Notes |
@@ -182,15 +257,39 @@ curl http://192.168.0.99:8766/jobs/$JOB_ID -H "X-Auth-Token: $LTS_AUTH_TOKEN"
 - See `docs/tasks/TASK-D-trash-retention-multi-worker-hardening.md`
   for the task spec + acceptance criteria.
 
+### Phase E + F complete (Mac Mini LAN deploy, 2026-07-05)
+
+- ✅ **E — Deploy on the Mac Mini.** `local-transcription-service` is
+  reachable from a Windows host on the LAN at
+  `http://192.168.0.99:8766`. Real-gateway e2e: `POST /jobs` for
+  `dQw4w9WgXcQ` reaches `done` in ~18 s, full transcript retrieved,
+  `POST /jobs/{id}/ack` clears `acked_at` and moves the transcript to
+  `trash/`. This closes the "manual smoke on a Mac Mini-reachable
+  host" gate that was SKIP during the Phase B integration run.
+- ✅ **F — System LaunchDaemon, venv-pinned subprocess.** The service
+  now runs under `/Library/LaunchDaemons/local.local-transcription-service.plist`
+  (mirror of `local.litellm.plist` / `local.whisper.plist`) — same
+  install pattern as the sibling services. Env vars moved out of the
+  plist into the wrapper's source (`run.sh` reads `$HOME/.lts-env`).
+  `app.py` hardcodes the yt-dlp path to `.venv/bin/yt-dlp` so the
+  bare `fetch_media(... ytdlp_bin="yt-dlp")` lookup can't accidentally
+  hit the user's `~/Library/Python/3.9/bin/yt-dlp` (LibreSSL → urllib3
+  modern-TLS fail). `pyproject.toml` now lists `httpx` and `yt-dlp` as
+  runtime deps (no longer only in dev). See
+  `docs/changelogs/CHANGELOG.md` (2026-07-05 entries) for the
+  per-surface breakdown, and `docs/runbooks/macmini-deployment.md`
+  for the full architecture + recovery runbook.
+
 ### Open follow-ups (not blocking MVP)
 
 - `medium` vs `large-v3-turbo` benchmark (`scripts/whisper-macmini/bench-whisper.sh`)
   — optional, kept open from Phase B (HLD §4 — `medium` is also downloaded; swap
   is a config/wrapper change).
-- Manual smoke on a Mac Mini-reachable host (real gateway
-  `192.168.0.99:4000`) — extension-side verification only; not blocking service
-  merge. The Phase B opt-in integration test (`@pytest.mark.integration`) is the
-  future gate for this.
+- Carry-overs from the Phase E + F session — see
+  [`docs/backlog.md`](docs/backlog.md): **BLG-001** WARP auto-connect
+  on reboot, **BLG-002** `chmod 600` on `$HOME/.lts-{env,token}`,
+  **BLG-003** rotate the `LTS_AUTH_TOKEN` and `LTS_STT_API_KEY` values
+  that were pasted into the mavis chat transcript during Phase E.
 
 **STT engine** (HLD §4 amended 2026-07-03): whisper.cpp (Metal) on the Mac
 Mini, fronted by the existing LiteLLM Proxy (`:4000`) via OpenAI
