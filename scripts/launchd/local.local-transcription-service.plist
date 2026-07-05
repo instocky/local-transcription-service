@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Mirrors /Library/LaunchDaemons/local.litellm.plist and
+        local.whisper.plist on this Mac Mini. System LaunchDaemon
+        (in /Library/LaunchDaemons/) allows <key>UserName</key> —
+        user LaunchAgents (in ~/Library/LaunchAgents/) do NOT, and
+        that mismatch was the root cause of the previous bootstrap
+        exit 125. Run shell wrapper as the user; wrapper does the
+        actual environment load + exec.
+    -->
+
+    <key>Label</key>
+    <string>com.local-transcription-service</string>
+
+    <key>UserName</key>
+    <string>uri</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/local-transcription-service/scripts/launchd/run.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>/opt/local-transcription-service</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/uri/Library/Logs/local-transcription-service.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/uri/Library/Logs/local-transcription-service.err.log</string>
+
+</dict>
+</plist>

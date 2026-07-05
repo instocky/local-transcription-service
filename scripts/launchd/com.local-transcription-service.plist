@@ -1,72 +1,17 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.local-transcription-service</string>
-
-    <!-- Run as the logged-in user. -->
-    <key>UserName</key>
-    <string>__REPLACE_WITH_USERNAME__</string>
-
-    <!-- Service program. Adjust paths after `uv sync`. -->
-    <key>ProgramArguments</key>
-    <array>
-        <string>__REPLACE_WITH_REPO_ROOT__/.venv/bin/python</string>
-        <string>-m</string>
-        <string>local_transcription_service.app</string>
-    </array>
-
-    <key>WorkingDirectory</key>
-    <string>__REPLACE_WITH_REPO_ROOT__</string>
-
-    <!-- launchd does not source ~/.local-transcription/env implicitly.
-         Put every required LTS_* setting here or launch through a wrapper. -->
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-        <key>LTS_BIND_HOST</key>
-        <string>192.168.0.99</string>
-        <key>LTS_PORT</key>
-        <string>8766</string>
-        <key>LTS_DATA_DIR</key>
-        <string>__REPLACE_WITH_DATA_DIR__</string>
-        <key>LTS_AUTH_TOKEN</key>
-        <string>__REPLACE_WITH_AUTH_TOKEN__</string>
-        <key>LTS_STT_ENGINE</key>
-        <string>openai</string>
-        <key>LTS_STT_BASE_URL</key>
-        <string>http://192.168.0.99:4000/v1</string>
-        <key>LTS_STT_API_KEY</key>
-        <string>__REPLACE_WITH_API_KEY__</string>
-        <key>LTS_MODEL</key>
-        <string>whisper-large-v3-turbo</string>
-        <key>LTS_WORKER_COUNT</key>
-        <string>1</string>
-    </dict>
-
-    <!-- Run on user login; restart on crash. -->
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-        <key>Crashed</key>
-        <true/>
-    </dict>
-
-    <!-- Throttle restart attempts. -->
-    <key>ThrottleInterval</key>
-    <integer>10</integer>
-
-    <!-- stdout/stderr captured by launchd. Inspect with:
-         log show --predicate 'process == "Python"' --last 1h
-         or tail -f ~/Library/Logs/local-transcription-service.log -->
-    <key>StandardOutPath</key>
-    <string>__REPLACE_WITH_LOG_PATH__</string>
-    <key>StandardErrorPath</key>
-    <string>__REPLACE_WITH_LOG_PATH__</string>
-</dict>
-</plist>
+# DEPRECATED
+#
+# This plist was the Phase-D user LaunchAgent template.
+# Bootstrap failed with exit 125 because <key>UserName</key> is
+# FORBIDDEN in per-user LaunchAgents (~/Library/LaunchAgents/).
+#
+# Use `local.local-transcription-service.plist` in this directory
+# instead — it is a system LaunchDaemon that mirrors
+# /Library/LaunchDaemons/local.litellm.plist on this Mac Mini.
+#
+# Install instructions:
+#   sudo cp scripts/launchd/local.local-transcription-service.plist /Library/LaunchDaemons/
+#   sudo chown root:wheel /Library/LaunchDaemons/local.local-transcription-service.plist
+#   sudo chmod 644 /Library/LaunchDaemons/local.local-transcription-service.plist
+#   sudo launchctl bootstrap system /Library/LaunchDaemons/local.local-transcription-service.plist
+#
+# See README.md §"Deploying" for the full Mac Mini workflow.

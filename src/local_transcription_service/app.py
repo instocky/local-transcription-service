@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import uvicorn
@@ -98,6 +99,27 @@ def build_stt_engine(settings: Settings) -> STTEngine:
     raise ValueError(msg)
 
 
+def _resolve_venv_binary(name: str) -> str:
+    """Resolve a binary from the running Python's venv.
+
+    Falls back to bare ``name`` (PATH lookup) if the venv binary
+    is missing — that path keeps tests green without a fully
+    provisioned venv, and lets an operator override the location
+    via PATH if they really want to.
+
+    Why we explicitly pin to ``sys.executable``'s directory:
+    on macOS the operator's shell ``$PATH`` typically contains
+    ``/Users/uri/Library/Python/3.9/bin`` (from ``pip3 install
+    --user``) BEFORE the repo's ``.venv/bin``. That older yt-dlp
+    runs on Apple CommandLineTools-Python with LibreSSL 2.8.3,
+    which makes ``urllib3 v2`` fail the modern-TLS handshake
+    to YouTube. Resolving from the venv — which is on Python
+    3.12 with a current OpenSSL — sidesteps the entire class.
+    """
+    candidate = Path(sys.executable).parent / name
+    return str(candidate) if candidate.exists() else name
+
+
 def build_pipeline(settings: Settings, engine: STTEngine) -> TranscriptionPipeline:
     """Construct the orchestration pipeline for production wiring.
 
@@ -105,7 +127,11 @@ def build_pipeline(settings: Settings, engine: STTEngine) -> TranscriptionPipeli
     yt-dlp → ffmpeg → STTEngine orchestrator, TASK-B §B4). Tests
     can substitute :class:`MockPipeline` directly via ``create_app``.
     """
-    return WhisperPipeline(stt_engine=engine, audio_cache_dir=settings.audio_cache_dir)
+    return WhisperPipeline(
+        stt_engine=engine,
+        audio_cache_dir=settings.audio_cache_dir,
+        ytdlp_bin=_resolve_venv_binary("yt-dlp"),
+    )
 
 
 def _log_config_resolved(settings: Settings) -> None:
